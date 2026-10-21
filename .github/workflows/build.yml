@@ -17,19 +17,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ubuntu-latest 镜像自带 Android SDK（ANDROID_HOME=/usr/local/lib/android/sdk，
+      # 含 platforms;android-34 与 build-tools;34.0.0），无需再装 setup-android。
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept licenses & install platform 34
+      - name: Point Gradle at preinstalled SDK
         run: |
-          yes | sdkmanager --licenses > /dev/null 2>&1 || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          echo "ANDROID_HOME=${ANDROID_HOME:-/usr/local/lib/android/sdk}" >> $GITHUB_ENV
+          echo "sdk.dir=${ANDROID_HOME:-/usr/local/lib/android/sdk}" > local.properties
+          ls ${ANDROID_HOME:-/usr/local/lib/android/sdk}/platforms
 
       - name: Gradle cache
         uses: actions/cache@v4
