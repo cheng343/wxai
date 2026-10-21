@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  模块 App 设置界面用到的字符串。
+  注意：这是新增文件，不要合并进已有的 values/strings.xml（那个文件只有 app_name /
+  xposed_description，由其他人维护）。
+-->
+<resources>
+
+    <!-- 开关与分组 -->
+    <string name="label_enabled">启用自动回复（总开关）</string>
+    <string name="label_group_only_mention">群聊仅在 @我 时回复</string>
+    <string name="label_debug">调试模式（在微信里用 Toast 显示处理过程）</string>
+
+    <!-- 接口 -->
+    <string name="label_base_url">接口地址（OpenAI 兼容，末尾可带 /v1，不要带 /chat/completions）</string>
+    <string name="hint_base_url">https://api.deepseek.com/v1</string>
+    <string name="label_api_key">API Key</string>
+    <string name="hint_api_key">sk-...</string>
+    <string name="label_model">模型名</string>
+    <string name="hint_model">deepseek-chat</string>
+    <string name="label_system_prompt">系统提示词（发给模型的 system 内容）</string>
+    <string name="label_temperature">温度 temperature（0 ~ 2，越大越随机）</string>
+    <string name="hint_temperature">0.7</string>
+
+    <!-- 会话 -->
+    <string name="label_whitelist">白名单会话（留空 = 不回复任何人）</string>
+    <string name="hint_whitelist">一行一个 wxid 或 xxx@chatroom</string>
+    <string name="label_nickname">我的微信昵称（群聊判断 @我 用，可留空）</string>
+    <string name="hint_nickname">留空时群聊只要内容含 @ 就回复</string>
+    <string name="label_cooldown">同一会话冷却时间（秒）</string>
+    <string name="hint_cooldown">20</string>
+    <string name="label_max_per_hour">每个会话每小时最多回复（条）</string>
+    <string name="hint_max_per_hour">30</string>
+    <string name="label_delay_min">回复最小延迟（毫秒）</string>
+    <string name="hint_delay_min">800</string>
+    <string name="label_delay_max">回复最大延迟（毫秒，需 ≥ 最小延迟）</string>
+    <string name="hint_delay_max">2500</string>
+    <string name="label_max_chars">回复最大字符数（超出截断）</string>
+    <string name="hint_max_chars">300</string>
+
+    <!-- 按钮与状态 -->
+    <string name="btn_save">保存</string>
+    <string name="btn_test">测试连接</string>
+    <string name="status_idle">填好接口地址与 API Key 后，可点「测试连接」验证模型是否可用。</string>
+    <string name="status_testing">正在请求模型，请稍候（最长约 90 秒）…</string>
+    <string name="status_test_ok">连接成功，模型回复：%1$s</string>
+    <string name="status_test_fail">连接失败：%1$s</string>
+    <string name="status_test_xposed_issue">请求失败，但具体错误被 AiClient 内部的 XposedBridge 日志调用（L）吞掉了——模块 App 进程里没有 Xposed。请在 Logcat 查看，或让 hook 侧把 Log.kt 改成在普通 App 进程也安全。</string>
+    <string name="toast_saved">已保存</string>
+
+</resources>

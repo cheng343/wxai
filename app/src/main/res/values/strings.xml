@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">微信 AI 助手</string>
+    <string name="xposed_description">收到白名单会话的文本消息时，调用 OpenAI 兼容接口自动生成并发送回复。仅支持微信 8.0.76。</string>
+</resources>
