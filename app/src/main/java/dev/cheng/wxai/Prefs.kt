@@ -15,6 +15,9 @@ object Prefs {
     const val PREFS_NAME = "wxai_config"
     const val KEY_CONFIG_JSON = "config_json"
 
+    /** 微信进程推上来的会话列表快照（ConvSnapshot.toJson()） */
+    const val KEY_CONVERSATIONS_JSON = "conversations_json"
+
     /**
      * 读配置。任何异常（含 SP 损坏、Config.fromJson 内部 L 在模块 App 进程里抛
      * NoClassDefFoundError）都回落到 Config.DEFAULT（enabled=false，安全默认）。
@@ -32,6 +35,20 @@ object Prefs {
     fun save(ctx: Context, cfg: Config) {
         val json = cfg.toJson().toString()
         prefs(ctx).edit().putString(KEY_CONFIG_JSON, json).apply()
+    }
+
+    /** 读微信进程推上来的会话列表快照；从未推送过返回 EMPTY。 */
+    fun loadConversations(ctx: Context): ConvSnapshot {
+        return try {
+            ConvSnapshot.fromJson(prefs(ctx).getString(KEY_CONVERSATIONS_JSON, null))
+        } catch (t: Throwable) {
+            ConvSnapshot.EMPTY
+        }
+    }
+
+    /** 写会话列表快照（由 ConfigProvider 在微信进程调用 update() 时落盘）。 */
+    fun saveConversations(ctx: Context, rawJson: String) {
+        prefs(ctx).edit().putString(KEY_CONVERSATIONS_JSON, rawJson).apply()
     }
 
     private fun prefs(ctx: Context): SharedPreferences {

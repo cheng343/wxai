@@ -46,6 +46,38 @@ object DexMap {
     /** r1.g(NetSceneBase): boolean —— 把场景投进队列 */
     const val QUEUE_POST_METHOD = "g"
 
+    // ---- 数据库（WeKit「数据库服务」feature 的实测 key）----
+    //
+    // 取库句柄的三步走（与 WeKit 完全一致，见 WeDatabaseApi.initializeDatabase）：
+    //   1. hm0.j1.u()（static）→ 返回 CoreStorage（hm0.b0）
+    //   2. CoreStorage 里某个字段的运行时类型是 SqliteDBWrapper（ka5.b0）
+    //   3. 该 wrapper 上有一个无参、返回 com.tencent.wcdb.database.SQLiteDatabase 的方法
+    // 我们不用硬编码第 3 步的方法名，而是按"无参 + 返回类型含 SQLiteDatabase"扫描，
+    // 这样换小版本时只要 1、2 两条没变就还能工作。
+
+    /** hm0.j1 —— MMKernel（微信内核门面，静态方法取全局存储） */
+    const val MM_KERNEL = "hm0.j1"
+
+    /** hm0.j1.u()：static，无参，返回 CoreStorage */
+    const val MM_KERNEL_GET_STORAGE = "u"
+
+    /** hm0.b0 —— CoreStorage */
+    const val CORE_STORAGE = "hm0.b0"
+
+    /** ka5.b0 —— SqliteDBWrapper（内含 wcdb 句柄） */
+    const val SQLITE_WRAPPER = "ka5.b0"
+
+    /** com.tencent.wcdb.database.SQLiteDatabase 的全名（用于按返回类型反射定位） */
+    const val WCDB_DATABASE = "com.tencent.wcdb.database.SQLiteDatabase"
+
+    /** 会话列表查询：rconversation 左连 rcontact 拿展示名，按活跃时间倒序 */
+    val SQL_CONVERSATIONS: String = """
+        SELECT c.username, c.unReadCount, r.nickname, r.conRemark, r.type
+        FROM rconversation c
+        LEFT JOIN rcontact r ON r.username = c.username
+        ORDER BY c.conversationTime DESC
+    """.trimIndent()
+
     // ---- MsgInfo 字段名（微信未混淆，可直接按名取）----
     const val F_TALKER = "field_talker"
     const val F_CONTENT = "field_content"

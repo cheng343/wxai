@@ -70,6 +70,13 @@ class MainHook : IXposedHookLoadPackage {
         }
 
         Hooks.install(ctx, cl)
+
+        // 会话枚举（白名单选择器用）：独立于回复链路，失败不影响自动回复
+        try {
+            ConversationBridge.install(ctx, cl)
+        } catch (t: Throwable) {
+            L.e("ConversationBridge.install failed", t)
+        }
     }
 
     private fun packageInfo(ctx: Context): PackageInfo? = try {

@@ -33,6 +33,17 @@ class ConfigProvider : ContentProvider() {
         /** 路径段：content://dev.cheng.wxai.config/config */
         const val PATH = "config"
 
+        /**
+         * 会话列表路由：content://dev.cheng.wxai.config/conversations
+         *
+         * GET  → 返回上一次微信进程推上来的会话快照（App 侧读）
+         * PUT  → 微信进程把新快照写进来（update 调用），只接受微信 uid
+         *
+         * 为什么反着来：会话数据本来就在微信进程里，App 不能直接读微信库，
+         * 所以由微信进程 push、App pull 缓存。Provider 只当信箱，不做查询。
+         */
+        const val PATH_CONVERSATIONS = "conversations"
+
         /** 唯一一列的列名，ConfigBridge 按这个名字取值。 */
         const val COLUMN_JSON = "json"
 
@@ -41,6 +52,9 @@ class ConfigProvider : ContentProvider() {
 
         /** 与 ConfigBridge 里 Uri.parse("content://dev.cheng.wxai.config/config") 等价。 */
         fun configUri(): Uri = Uri.parse("content://$AUTHORITY/$PATH")
+
+        /** 会话快照信箱的 Uri（微信进程 update，App query）。 */
+        fun conversationsUri(): Uri = Uri.parse("content://$AUTHORITY/$PATH_CONVERSATIONS")
     }
 
     override fun onCreate(): Boolean = true
@@ -63,9 +77,14 @@ class ConfigProvider : ContentProvider() {
         }
 
         val json = try {
-            Prefs.load(ctx).toJson().toString()
+            if (uri.lastPathSegment == PATH_CONVERSATIONS) {
+                // 会话快照信箱：返回上一次微信进程推上来的 JSON（可能是空快照）
+                Prefs.loadConversations(ctx).toJson()
+            } else {
+                Prefs.load(ctx).toJson().toString()
+            }
         } catch (t: Throwable) {
-            Log.e(TAG, "build config json failed", t)
+            Log.e(TAG, "build json failed for $uri", t)
             return null
         }
 
@@ -80,12 +99,36 @@ class ConfigProvider : ContentProvider() {
 
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
 
+    /**
+     * 唯一的写路径：微信进程推会话快照。
+     *
+     * 只接受 /conversations，且调用方必须是微信或本 App；
+     * 其他 App 即使猜到 authority 也写不进来（isTrustedCaller 挡）。
+     */
     override fun update(
         uri: Uri,
         values: ContentValues?,
         selection: String?,
         selectionArgs: Array<out String>?,
-    ): Int = 0
+    ): Int {
+        if (uri.lastPathSegment != PATH_CONVERSATIONS) {
+            Log.w(TAG, "update ignored for $uri")
+            return 0
+        }
+        if (!isTrustedCaller()) {
+            Log.w(TAG, "update rejected, callingUid=" + Binder.getCallingUid())
+            return 0
+        }
+        val ctx = context ?: return 0
+        val raw = values?.getAsString(COLUMN_JSON) ?: return 0
+        return try {
+            Prefs.saveConversations(ctx, raw)
+            1
+        } catch (t: Throwable) {
+            Log.e(TAG, "save conversations failed", t)
+            0
+        }
+    }
 
     override fun getType(uri: Uri): String? = null
 

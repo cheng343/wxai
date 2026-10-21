@@ -15,3 +15,6 @@ build-log*.txt
 # OS
 .DS_Store
 Thumbs.db
+build-*.log
+*.apk
+
