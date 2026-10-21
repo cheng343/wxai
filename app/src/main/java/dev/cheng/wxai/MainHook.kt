@@ -78,7 +78,11 @@ class MainHook : IXposedHookLoadPackage {
             L.w("enabled=true but apiKey is empty — replies will fail")
         }
 
-        Hooks.install(ctx, cl)
+        try {
+            Hooks.install(ctx, cl)
+        } catch (t: Throwable) {
+            L.e("Hooks.install failed", t)
+        }
 
         // 会话枚举（白名单选择器用）：独立于回复链路，失败不影响自动回复
         try {

@@ -1,8 +1,10 @@
-# LSPosed 用类名反射加载入口，R8 不能改名/删除
--keep class dev.cheng.wxai.MainHook { *; }
-# 系统按 manifest 实例化
--keep class dev.cheng.wxai.ConfigProvider { *; }
--keep class dev.cheng.wxai.SettingsActivity { *; }
+# ── wxai 模块类全部保留 ──────────────────────────────────────
+# LSPosed 注入后，XposedHelpers 通过反射加载本模块的类；
+# R8 optimize 模式会做 class-merge / method-inline / field-strip，
+# 极易把 hook 链上的 object 单例、data class、常量类删掉或合并。
+# 模块自身代码本来就很小，全部 keep 最安全。
+-keep class dev.cheng.wxai.** { *; }
+
 # Compose 的 Activity 里做 setContent，保留 ExtensionActivity 相关
 -keep class androidx.activity.ComponentActivity { *; }
 

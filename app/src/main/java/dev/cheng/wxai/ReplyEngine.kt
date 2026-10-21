@@ -46,7 +46,7 @@ object ReplyEngine {
     @Volatile
     private var appCtx: Context? = null
 
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     fun start(ctx: Context) {
         appCtx = ctx.applicationContext ?: ctx
