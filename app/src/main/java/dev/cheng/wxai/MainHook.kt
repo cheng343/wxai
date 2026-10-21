@@ -59,6 +59,24 @@ class MainHook : IXposedHookLoadPackage {
     }
 
     private fun boot(ctx: Context, cl: ClassLoader) {
+        // 关键防护 1：第一时间拦截微信自己的 Xposed 堆栈检测（h3.a），防止微信自杀/闪退
+        try {
+            XposedHelpers.findAndHookMethod(
+                DexMap.ANTI_DETECT_CLASS,
+                cl,
+                DexMap.ANTI_DETECT_METHOD,
+                Array<StackTraceElement>::class.java,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = false
+                    }
+                }
+            )
+            L.i("anti-detect: hooked ${DexMap.ANTI_DETECT_CLASS}.${DexMap.ANTI_DETECT_METHOD}")
+        } catch (t: Throwable) {
+            L.w("anti-detect hook skip or failed: ${t.message}")
+        }
+
         val info = packageInfo(ctx)
         val versionName = info?.versionName ?: "?"
         val versionCode = longVersionCode(info)

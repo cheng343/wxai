@@ -89,4 +89,9 @@ object DexMap {
 
     /** 文本消息类型码 */
     const val TYPE_TEXT = 1
+
+    // ---- 微信自研反检测点（WeKit PreventXposedDetection 实测）----
+    /** com.tencent.mm.app.h3.a(StackTraceElement[]): boolean —— 微信检测堆栈是否含 Xposed */
+    const val ANTI_DETECT_CLASS = "com.tencent.mm.app.h3"
+    const val ANTI_DETECT_METHOD = "a"
 }

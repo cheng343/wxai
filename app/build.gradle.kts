@@ -11,8 +11,8 @@ android {
         applicationId = "dev.cheng.wxai"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "1.2.1"
+        versionCode = 5
+        versionName = "1.2.2"
     }
 
     buildFeatures {
@@ -23,8 +23,18 @@ android {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
 
+    signingConfigs {
+        create("shared") {
+            storeFile = file("debug.keystore")
+            storePassword = "android"
+            keyAlias = "androiddebugkey"
+            keyPassword = "android"
+        }
+    }
+
     buildTypes {
         debug {
+            signingConfig = signingConfigs.getByName("shared")
             // 模块包会被 LSPosed 注入到微信的每个进程，dex 越小越安全：
             // debug 也开 R8，只保留必要的调试信息
             isMinifyEnabled = true
@@ -32,6 +42,7 @@ android {
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         release {
+            signingConfig = signingConfigs.getByName("shared")
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
