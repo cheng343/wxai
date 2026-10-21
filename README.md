@@ -84,11 +84,17 @@
 3. 会话枚举用到的 4 个 key：`classMmKernel`、`methodGetStorage`、`classCoreStorage`、`classSqliteDbWrapper`，一并覆盖。
 4. 字段名若也变了，同步 `DexMap.F_*`。
 
-## 构建
+## 构建（一律走云编译）
 
-- **云端**：push 到 `main` 自动跑 `.github/workflows/build.yml`，产物在 Actions 的 artifact `wxai-debug-apk`；打 `v*` tag 会自动建 Release 并附 APK。
-- **本地**：需 JDK 17+ 与 Android SDK（platform 34 / build-tools 34.0.0），然后 `build.cmd`（Windows）或 `./gradlew assembleDebug`。
-- 界面依赖 Jetpack Compose（BOM 2024.06.00 / Material3 1.2.1），首次构建会拉依赖。
+**唯一的正式出包方式**是 GitHub Actions，本地编译仅作应急排查用。
+
+- push 到 `main` 自动跑 `.github/workflows/build.yml`（ubuntu-latest + JDK 17 + runner 预装 Android SDK），产物在 Actions 的 artifact `wxai-debug-apk`
+- 打 `v*` tag 会自动建 Release，并附 `wxai-debug.apk` + `SHA256SUMS.txt`，直接从这里下载安装包：
+  <https://github.com/cheng343/wxai/releases>
+- 下载后可用 `SHA256SUMS.txt` 校验：`sha256sum -c SHA256SUMS.txt`
+- 云端包与本地包的 debug 签名**不同**，互换安装前要先卸载
+
+界面依赖 Jetpack Compose（BOM 2024.06.00 / Material3 1.2.1）。仓库已转为 public，Actions 分钟数不受免费额度限制，Release 无需登录即可下载。
 
 ## 排障
 
