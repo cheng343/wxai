@@ -11,8 +11,8 @@ android {
         applicationId = "dev.cheng.wxai"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
     }
 
     buildFeatures {
@@ -25,10 +25,15 @@ android {
 
     buildTypes {
         debug {
-            isMinifyEnabled = false
+            // 模块包会被 LSPosed 注入到微信的每个进程，dex 越小越安全：
+            // debug 也开 R8，只保留必要的调试信息
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -67,10 +72,9 @@ dependencies {
     implementation(composeBom)
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
-    implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
-    implementation("androidx.compose.material:material-icons-extended")
+    // 只用 core 图标集（50 个）。extended 有 2000+ 个 vector 类，会把 classes.dex 撑到 44MB
+    implementation("androidx.compose.material:material-icons-core")
     implementation("androidx.activity:activity-compose:1.8.2")
-    debugImplementation("androidx.compose.ui:ui-tooling")
 }

@@ -16,8 +16,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.Visibility
-import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -275,11 +273,8 @@ fun EditTextDialog(
                 keyboardOptions = KeyboardOptions(keyboardType = keyboardType),
                 trailingIcon = if (password) {
                     {
-                        IconButton(onClick = { revealed = !revealed }) {
-                            Icon(
-                                imageVector = if (revealed) Icons.Filled.VisibilityOff else Icons.Filled.Visibility,
-                                contentDescription = if (revealed) "隐藏" else "显示",
-                            )
+                        TextButton(onClick = { revealed = !revealed }) {
+                            Text(if (revealed) "隐藏" else "显示")
                         }
                     }
                 } else {

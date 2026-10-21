@@ -36,10 +36,19 @@ class MainHook : IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         val ctx = param.args.firstOrNull() as? Context ?: return
-                        try {
-                            boot(ctx, lpparam.classLoader)
-                        } catch (t: Throwable) {
-                            L.e("boot failed", t)
+                        // 关键：初始化不在微信主线程上做。
+                        // Application.attach 期间主线程任何阻塞（跨进程查配置、装 hook）都可能拖死启动，
+                        // 所以全部丢到后台线程，失败也只写日志。
+                        val cl = lpparam.classLoader
+                        Thread({
+                            try {
+                                boot(ctx, cl)
+                            } catch (t: Throwable) {
+                                L.e("boot failed", t)
+                            }
+                        }, "wxai-boot").apply {
+                            isDaemon = true
+                            start()
                         }
                     }
                 }

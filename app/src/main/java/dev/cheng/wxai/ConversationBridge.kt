@@ -40,11 +40,9 @@ object ConversationBridge {
     private var storage: Any? = null
 
     fun install(ctx: Context, cl: ClassLoader) {
-        try {
-            hookKernel(ctx, cl)
-        } catch (t: Throwable) {
-            L.e("$TAG hook ${DexMap.MM_KERNEL}.${DexMap.MM_KERNEL_GET_STORAGE} failed", t)
-        }
+        // 注意：这里【不】hook MMKernel.u()。
+        // u() 是微信启动期间被高频调用的内核 getter，挂全局 after-hook 属于高风险改动；
+        // 反正拿句柄只需要一次，用后台轮询即可（最多晚 3 秒）。
 
         try {
             registerRefreshReceiver(ctx)
@@ -59,25 +57,6 @@ object ConversationBridge {
     }
 
     // ---------------- 取 DB 句柄 ----------------
-
-    private fun hookKernel(ctx: Context, cl: ClassLoader) {
-        XposedHelpers.findAndHookMethod(
-            DexMap.MM_KERNEL,
-            cl,
-            DexMap.MM_KERNEL_GET_STORAGE,
-            object : XC_MethodHook() {
-                override fun afterHookedMethod(param: MethodHookParam) {
-                    val obj = param.result ?: return
-                    try {
-                        tryCapture(ctx, obj)
-                    } catch (t: Throwable) {
-                        L.e("$TAG capture from hook failed", t)
-                    }
-                }
-            }
-        )
-        L.i("$TAG hooked ${DexMap.MM_KERNEL}.${DexMap.MM_KERNEL_GET_STORAGE}()")
-    }
 
     /** 主动轮询 mmkernel.u()，直到返回非 null（微信启动早期会抛"未初始化"）。 */
     private fun awaitKernel(ctx: Context, cl: ClassLoader) {
