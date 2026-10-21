@@ -1,2 +1,0 @@
-74fe913d494e989d62969c904b52c6b76d6c50b823c5fb15dab9529cc12800a6  out/wxai-debug.apk
-
