@@ -35,6 +35,17 @@ object ConversationBridge {
     @Volatile
     private var wekitClassLoader: ClassLoader? = null
 
+    /** 微信 wxid -> 展示名（备注优先，其次昵称）缓存 */
+    private val displayNameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    data class WechatMessageRecord(
+        val senderName: String,
+        val isSelf: Boolean,
+        val content: String,
+        val type: Int,
+        val createTimeMs: Long,
+    )
+
     fun install(ctx: Context, cl: ClassLoader) {
         val app = ctx.applicationContext ?: ctx
         appClassLoader = cl
@@ -241,6 +252,7 @@ object ConversationBridge {
                 val name = remark?.takeIf { it.isNotBlank() }
                     ?: nickname?.takeIf { it.isNotBlank() }
                     ?: username
+                displayNameCache[username] = name
                 items.add(
                     ConvEntry(
                         username = username,
@@ -262,6 +274,200 @@ object ConversationBridge {
 
         L.i("$TAG enumerated ${items.size} conversations")
         return ConvSnapshot(items = items, error = null, timestamp = System.currentTimeMillis())
+    }
+
+    // ---------------- Agent 跨对话查询与联系人解析 ----------------
+
+    private fun ensureDb(): Any? {
+        database?.let { return it }
+        tryCaptureFromKernel()
+        return database
+    }
+
+    private fun sqlEscape(s: String): String = s.replace("'", "''")
+
+    /**
+     * 根据 wxid / chatroomId 获取展示名称（备注名优先，其次昵称，查不到返回原 id）。
+     */
+    fun getDisplayName(talker: String): String {
+        val clean = talker.trim()
+        if (clean.isEmpty()) return ""
+        displayNameCache[clean]?.let { return it }
+
+        val db = ensureDb() ?: return clean
+        val esc = sqlEscape(clean)
+        val sql = "SELECT conRemark, nickname FROM rcontact WHERE username = '$esc' LIMIT 1"
+        try {
+            rawQuery(db, sql)?.use { cur ->
+                if (cur.moveToFirst()) {
+                    val remark = if (!cur.isNull(0)) cur.getString(0) else null
+                    val nick = if (cur.columnCount > 1 && !cur.isNull(1)) cur.getString(1) else null
+                    val name = remark?.takeIf { it.isNotBlank() }
+                        ?: nick?.takeIf { it.isNotBlank() }
+                        ?: clean
+                    displayNameCache[clean] = name
+                    return name
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return clean
+    }
+
+    /**
+     * 按关键词（备注名、昵称、微信号 alias 或 username）搜索联系人或群聊。
+     */
+    fun findContacts(query: String, limit: Int = 15): List<ConvEntry> {
+        val db = ensureDb() ?: return emptyList()
+        val q = query.trim()
+        val safeLimit = limit.coerceIn(1, 50)
+        val sql = if (q.isEmpty()) {
+            """
+            SELECT c.username, c.unReadCount, r.nickname, r.conRemark
+            FROM rconversation c
+            LEFT JOIN rcontact r ON r.username = c.username
+            ORDER BY c.conversationTime DESC
+            LIMIT $safeLimit
+            """.trimIndent()
+        } else {
+            val esc = sqlEscape(q)
+            """
+            SELECT r.username, 0, r.nickname, r.conRemark
+            FROM rcontact r
+            WHERE (r.conRemark LIKE '%$esc%' OR r.nickname LIKE '%$esc%' OR r.alias = '$esc' OR r.username = '$esc')
+              AND r.username NOT LIKE 'gh_%'
+              AND r.username NOT LIKE 'fake_%'
+            LIMIT $safeLimit
+            """.trimIndent()
+        }
+
+        val list = ArrayList<ConvEntry>()
+        try {
+            rawQuery(db, sql)?.use { cur ->
+                while (cur.moveToNext()) {
+                    val username = if (cur.isNull(0)) null else cur.getString(0)
+                    if (username.isNullOrBlank()) continue
+                    val unread = if (cur.columnCount > 1 && !cur.isNull(1)) cur.getInt(1) else 0
+                    val nick = if (cur.columnCount > 2 && !cur.isNull(2)) cur.getString(2) else null
+                    val remark = if (cur.columnCount > 3 && !cur.isNull(3)) cur.getString(3) else null
+                    val name = remark?.takeIf { it.isNotBlank() }
+                        ?: nick?.takeIf { it.isNotBlank() }
+                        ?: username
+                    displayNameCache[username] = name
+                    list.add(
+                        ConvEntry(
+                            username = username,
+                            name = name,
+                            isGroup = username.endsWith("@chatroom"),
+                            unread = unread.coerceAtLeast(0),
+                            lastTime = 0L,
+                        )
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            L.e("$TAG findContacts($q) failed", t)
+        }
+        return list
+    }
+
+    /**
+     * 将用户/AI 给出的目标标识（可能是 wxid_xxx、xxx@chatroom、备注名或昵称）解析为准确的微信 talker ID。
+     */
+    fun resolveTargetTalker(target: String): ConvEntry? {
+        val clean = target.trim()
+        if (clean.isEmpty()) return null
+
+        // 1. 如果本身看起来就是 wxid / chatroom / filehelper，先直接查库验证
+        if (clean.startsWith("wxid_") || clean.endsWith("@chatroom") || clean == "filehelper") {
+            val display = getDisplayName(clean)
+            return ConvEntry(
+                username = clean,
+                name = display,
+                isGroup = clean.endsWith("@chatroom"),
+                unread = 0,
+                lastTime = 0L,
+            )
+        }
+
+        // 2. 搜索匹配的联系人，优先精确匹配（备注完全一致 > 昵称完全一致 > 包含匹配）
+        val candidates = findContacts(clean, limit = 20)
+        if (candidates.isEmpty()) return null
+
+        candidates.firstOrNull { it.username.equals(clean, ignoreCase = true) }?.let { return it }
+        candidates.firstOrNull { it.name.equals(clean, ignoreCase = true) }?.let { return it }
+        return candidates.first()
+    }
+
+    /**
+     * 从微信底层 message 表读取指定会话（talker）最近的聊天记录（按时间正序返回）。
+     */
+    fun queryWechatMessages(talker: String, limit: Int = 20): List<WechatMessageRecord> {
+        val db = ensureDb() ?: return emptyList()
+        val cleanTalker = talker.trim()
+        if (cleanTalker.isEmpty()) return emptyList()
+
+        val safeLimit = limit.coerceIn(1, 50)
+        val esc = sqlEscape(cleanTalker)
+        val isGroup = cleanTalker.endsWith("@chatroom")
+        val sql = """
+            SELECT isSend, type, content, createTime
+            FROM message
+            WHERE talker = '$esc'
+            ORDER BY createTime DESC
+            LIMIT $safeLimit
+        """.trimIndent()
+
+        val rawReversed = ArrayList<WechatMessageRecord>()
+        try {
+            rawQuery(db, sql)?.use { cur ->
+                while (cur.moveToNext()) {
+                    val isSend = if (cur.isNull(0)) 0 else cur.getInt(0)
+                    val type = if (cur.isNull(1)) 0 else cur.getInt(1)
+                    val rawContent = if (cur.isNull(2)) "" else cur.getString(2).orEmpty()
+                    val createTime = if (cur.isNull(3)) 0L else cur.getLong(3)
+                    val timeMs = if (createTime in 1L..9_999_999_999L) createTime * 1000L else createTime
+
+                    val isSelf = isSend != 0
+                    var sender = if (isSelf) "我" else getDisplayName(cleanTalker)
+                    var body = rawContent
+
+                    if (isGroup && !isSelf) {
+                        val idx = rawContent.indexOf(":\n")
+                        if (idx in 1..80) {
+                            val senderWxid = rawContent.substring(0, idx).trim()
+                            sender = getDisplayName(senderWxid)
+                            body = rawContent.substring(idx + 2).trim()
+                        }
+                    }
+
+                    val readableBody = when (type) {
+                        DexMap.TYPE_TEXT -> body.trim()
+                        3 -> "[图片]"
+                        34 -> "[语音]"
+                        43 -> "[视频]"
+                        47 -> "[表情包]"
+                        10000 -> "[系统提示: ${body.take(40)}]"
+                        else -> if (body.startsWith("<")) "[富媒体/卡片消息]" else body.take(120)
+                    }
+
+                    if (readableBody.isNotEmpty()) {
+                        rawReversed.add(
+                            WechatMessageRecord(
+                                senderName = sender,
+                                isSelf = isSelf,
+                                content = readableBody,
+                                type = type,
+                                createTimeMs = timeMs,
+                            )
+                        )
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            L.e("$TAG queryWechatMessages($cleanTalker) failed", t)
+        }
+        return rawReversed.asReversed()
     }
 
     private fun rawQuery(db: Any, sql: String): Cursor? {

@@ -207,6 +207,11 @@ fun SettingsScreen() {
                 update = update,
                 edit = { spec -> editor = spec },
             )
+            MemoryAndAgentCard(
+                cfg = cfg,
+                update = update,
+                edit = { spec -> editor = spec },
+            )
             WhitelistCard(
                 cfg = cfg,
                 snapshot = snapshot,
@@ -545,6 +550,72 @@ private fun ReplyPolicyCard(
                         onApply = { min, max ->
                             update { it.copy(replyDelayMinMs = min, replyDelayMaxMs = max) }
                         },
+                    )
+                )
+            },
+        )
+    }
+}
+
+@Composable
+private fun MemoryAndAgentCard(
+    cfg: Config,
+    update: (((Config) -> Config)) -> Unit,
+    edit: (EditorSpec) -> Unit,
+) {
+    SettingsCard(title = "记忆与 Agent 操控") {
+        SwitchRow(
+            title = "启用会话与长期记忆",
+            subtitle = "本地 SQLite 持久化多轮对话与永久事实档案（发 #重置 可清空）",
+            checked = cfg.enableMemory,
+            onCheckedChange = { value -> update { it.copy(enableMemory = value) } },
+        )
+        ValueRow(
+            title = "多轮上下文轮数",
+            value = "${cfg.maxHistoryTurns} 轮（最多 ${cfg.maxHistoryTurns * 2} 条消息）",
+            onClick = {
+                edit(
+                    EditorSpec.Number(
+                        title = "多轮上下文保留轮数",
+                        initial = cfg.maxHistoryTurns,
+                        min = 1,
+                        max = 50,
+                        onApply = { value -> update { it.copy(maxHistoryTurns = value) } },
+                    )
+                )
+            },
+        )
+        ValueRow(
+            title = "会话超时分割",
+            value = if (cfg.sessionExpireMinutes <= 0) "永不过期" else "${cfg.sessionExpireMinutes} 分钟",
+            onClick = {
+                edit(
+                    EditorSpec.Number(
+                        title = "会话超时分钟数（0 = 永不过期）",
+                        initial = cfg.sessionExpireMinutes,
+                        min = 0,
+                        max = 10080,
+                        onApply = { value -> update { it.copy(sessionExpireMinutes = value) } },
+                    )
+                )
+            },
+        )
+        SwitchRow(
+            title = "启用跨对话 Agent 操控",
+            subtitle = "允许 AI 跨对话查阅消息、搜索联系人、代发消息与存取长期记忆",
+            checked = cfg.enableAgentTools,
+            onCheckedChange = { value -> update { it.copy(enableAgentTools = value) } },
+        )
+        ValueRow(
+            title = "主人标识（特权限定）",
+            value = cfg.masterTalkers.ifBlank { "未限制（白名单内均可触发操控）" },
+            onClick = {
+                edit(
+                    EditorSpec.Text(
+                        title = "主人标识（wxid 或备注/昵称，逗号分隔）",
+                        initial = cfg.masterTalkers,
+                        placeholder = "留空则白名单内均可触发，或填你的昵称/wxid",
+                        onApply = { value -> update { it.copy(masterTalkers = value.trim()) } },
                     )
                 )
             },

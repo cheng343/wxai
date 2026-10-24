@@ -31,6 +31,16 @@ data class Config(
     /** 回复最大字符数，超出截断 */
     val maxReplyChars: Int = 300,
     val temperature: Double = 0.7,
+    /** 是否启用本地 SQLite 多轮会话记忆与长期事实记忆 */
+    val enableMemory: Boolean = true,
+    /** 单会话最大保留上下文轮数（1 轮 = 1 问 + 1 答） */
+    val maxHistoryTurns: Int = 12,
+    /** 会话超时时间（分钟），超过该时长未聊天则开启新上下文滑窗；0 表示永不过期 */
+    val sessionExpireMinutes: Int = 60,
+    /** 是否启用 Agent 跨对话操控能力（查联系人、读任意会话历史、跨会话代发消息、存取永久记忆） */
+    val enableAgentTools: Boolean = true,
+    /** 主人标识（可填 wxid 或昵称，多个用逗号分隔；留空则白名单内均可触发 Agent 操控） */
+    val masterTalkers: String = "",
     val debug: Boolean = true,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
@@ -48,13 +58,19 @@ data class Config(
         put("replyDelayMaxMs", replyDelayMaxMs)
         put("maxReplyChars", maxReplyChars)
         put("temperature", temperature)
+        put("enableMemory", enableMemory)
+        put("maxHistoryTurns", maxHistoryTurns)
+        put("sessionExpireMinutes", sessionExpireMinutes)
+        put("enableAgentTools", enableAgentTools)
+        put("masterTalkers", masterTalkers)
         put("debug", debug)
     }
 
     companion object {
         const val DEFAULT_PROMPT =
-            "你正在用微信和对方聊天。对方刚发来一条消息，请用简短、自然、口语化的中文直接回复，" +
-                "不要加任何前缀、称呼解释或引号，不要解释你在做什么。回复控制在两句话以内。"
+            "你正在用微信和对方聊天。你拥有完整的连续记忆与微信操控能力。" +
+                "平时聊天请用简短、自然、有温度的口语化中文直接回复，不要加引号或多余前缀，控制在两三句话以内；" +
+                "当对方向你询问其他对话情况、让你帮忙给别人带话/发消息、或透露重要个人信息时，请主动调用工具完成任务并如实汇报。"
 
         val DEFAULT = Config()
 
@@ -87,6 +103,11 @@ data class Config(
                     replyDelayMaxMs = o.optInt("replyDelayMaxMs", DEFAULT.replyDelayMaxMs),
                     maxReplyChars = o.optInt("maxReplyChars", DEFAULT.maxReplyChars),
                     temperature = o.optDouble("temperature", DEFAULT.temperature),
+                    enableMemory = o.optBoolean("enableMemory", DEFAULT.enableMemory),
+                    maxHistoryTurns = o.optInt("maxHistoryTurns", DEFAULT.maxHistoryTurns),
+                    sessionExpireMinutes = o.optInt("sessionExpireMinutes", DEFAULT.sessionExpireMinutes),
+                    enableAgentTools = o.optBoolean("enableAgentTools", DEFAULT.enableAgentTools),
+                    masterTalkers = o.str("masterTalkers", DEFAULT.masterTalkers),
                     debug = o.optBoolean("debug", true),
                 )
             } catch (t: Throwable) {
