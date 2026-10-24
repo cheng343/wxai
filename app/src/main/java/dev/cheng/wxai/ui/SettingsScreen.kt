@@ -1079,14 +1079,14 @@ private fun VisionServiceCard(
         )
         if (cfg.enableVision) {
             ValueRow(
-                title = "视觉模型（留空默认采用 Qwen2.5-VL / 主模型）",
-                value = cfg.visionModel.ifBlank { "默认智能匹配 (Qwen2.5-VL / 主模型)" },
+                title = "视觉模型（默认 deepseek-flash）",
+                value = cfg.visionModel.ifBlank { "默认 deepseek-flash" },
                 onClick = {
                     edit(
                         EditorSpec.Text(
                             title = "视觉模型名称",
                             initial = cfg.visionModel,
-                            placeholder = "Qwen/Qwen2.5-VL-72B-Instruct",
+                            placeholder = "deepseek-flash",
                             onApply = { value -> update { it.copy(visionModel = value.trim()) } },
                         )
                     )

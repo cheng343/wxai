@@ -49,8 +49,8 @@ data class Config(
     val masterTalkers: String = "",
     /** 是否启用多模态图片与表情包识图理解 */
     val enableVision: Boolean = true,
-    /** 视觉模型名称（若留空且主模型为文本模型，自动采用业内最强视觉备选 Qwen2.5-VL 或主模型） */
-    val visionModel: String = "",
+    /** 视觉模型名称（默认采用自带多模态视觉的 deepseek-flash） */
+    val visionModel: String = "deepseek-flash",
     val visionBaseUrl: String = "",
     val visionApiKey: String = "",
     val debug: Boolean = true,

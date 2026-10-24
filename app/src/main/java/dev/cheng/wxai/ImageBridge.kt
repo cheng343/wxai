@@ -20,8 +20,8 @@ import java.util.UUID
  * 1. 自动截获微信图片 (type=3) 与自定义表情包/贴纸 (type=47)；
  * 2. 桥接 WeKit 的 WeMessageApi.downloadImage / cacheAndSaveSticker / saveStickerByMd5 解码落地为标准 JPG/PNG/GIF；
  * 3. 自动将图片/表情包智能下采样压缩并转为 Base64 data URL；
- * 4. 多模态理解：若主模型或配置的 visionModel 支持视觉（如 Qwen2.5-VL / gpt-4o 等），调用大模型提取表情包画面、文字与梗；
- *    若主模型为纯文本模型（如官方 deepseek-chat），自动将识图结果转化为自然描述块并入对话上下文，实现 100% 懂图懂梗！
+ * 4. 多模态理解：默认采用自带多模态视觉的 deepseek-flash（或主模型/自定义视觉模型），调用大模型提取表情包画面、文字与梗；
+ *    自动将识图结果转化为自然描述块并入对话上下文，实现 100% 懂图懂梗！
  */
 object ImageBridge {
 
@@ -184,10 +184,8 @@ object ImageBridge {
         val apiKey = if (cfg.visionApiKey.isNotBlank()) cfg.visionApiKey else cfg.apiKey
         val model = when {
             cfg.visionModel.isNotBlank() -> cfg.visionModel.trim()
-            cfg.model.contains("vl", ignoreCase = true) ||
-                cfg.model.contains("vision", ignoreCase = true) ||
-                cfg.model.contains("4o", ignoreCase = true) -> cfg.model.trim()
-            else -> "Qwen/Qwen2.5-VL-72B-Instruct" // 业内最强开源视觉模型默认备选
+            cfg.model.isNotBlank() -> cfg.model.trim()
+            else -> "deepseek-flash"
         }
 
         if (apiKey.isBlank()) return null
