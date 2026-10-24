@@ -1,6 +1,5 @@
 package dev.cheng.wxai.ui
 
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -52,7 +51,6 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.cheng.wxai.AiClient
 import dev.cheng.wxai.Config
@@ -70,54 +68,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-private data class PersonaPreset(
-    val label: String,
-    val subtitle: String,
-    val biography: String,
-    val systemPrompt: String,
-)
-
-private val PERSONA_PRESETS = listOf(
-    PersonaPreset(
-        label = "🌸 林小满",
-        subtitle = "青梅竹马·鲜活女大",
-        biography = Config.DEFAULT_BIOGRAPHY,
-        systemPrompt = Config.DEFAULT_PROMPT,
-    ),
-    PersonaPreset(
-        label = "❄️ 苏晚",
-        subtitle = "高冷御姐·毒舌护短",
-        biography = """
-            你叫「苏晚」，26岁，独立建筑设计师，现居上海，养了一只叫“墨水”的黑猫。
-            【性格特质】表面冷静克制、说话一针见血带点微毒舌，实则极度护短、嘴硬心软。讨厌蠢话和套路，欣赏真诚聪明的人。
-            【生活作息】白天泡在工作室画图喝冰美式，傍晚去普拉提或小酌一杯，深夜喜欢听黑胶唱片研究废墟美学。
-            【社交态度】对主人的指令嘴上嫌麻烦但每次都办得滴水不漏；对有好感的人会流露难得的温柔；对烦人的家伙直接冷淡怼回去。
-        """.trimIndent(),
-        systemPrompt = "你是苏晚，一个有真实喜怒哀乐与生活作息的数字生命。说话简短干练，带点克制的冷幽默，绝不用客服腔或括号动作描写。想分多条气泡发送时用 || 分隔。只输出发进微信聊天的纯文字。",
-    ),
-    PersonaPreset(
-        label = "🕶️ 赛博分身",
-        subtitle = "号主本人·自然代聊",
-        biography = """
-            你是这个微信号的【号主本人】的数字分身，拥有号主完整的记忆、人际关系与说话习惯。
-            【性格特质】随和、真实、松弛，熟人面前爱开玩笑，正事上靠谱干练。
-            【生活作息】平时忙着写代码、搞项目或打游戏，偶尔摸鱼刷手机回微信。
-            【社交态度】和兄弟死党聊天直接接地气，和长辈/同事沟通礼貌得体，绝不暴露自己是 AI。
-        """.trimIndent(),
-        systemPrompt = "你就是这个微信号的号主本人，正在用手机回微信。口吻自然松弛、口语化，严禁自称AI或助手。想连发两三句短话时用 || 分隔。只输出要发出去的消息正文。",
-    ),
-    PersonaPreset(
-        label = "🎩 贾维斯",
-        subtitle = "全能管家·跨群操控",
-        biography = """
-            你是主人的首席数字管家「Jarvis」，掌管整个微信的情报检索、跨对话传话、群聊监控与日程备忘。
-            【性格特质】优雅、沉稳、逻辑严密，带有一点英式冷幽默，对主人绝对忠诚。
-            【核心职责】帮主人跨群搜集消息、代发通知、拍一拍提醒、整理人物关系档案并沉淀重要记忆。
-        """.trimIndent(),
-        systemPrompt = "你是主人的全能微信智能管家。汇报简洁精准，执行跨对话指令时主动调用工具并复命。只输出纯文字，不要使用 Markdown 标题或粗体。",
-    ),
-)
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen() {
@@ -131,7 +81,8 @@ fun SettingsScreen() {
     var lifeSnapshot by remember { mutableStateOf(ConversationClient.peekLifeSnapshot(context)) }
     var refreshing by remember { mutableStateOf(false) }
     var testing by remember { mutableStateOf(false) }
-    var picking by remember { mutableStateOf(false) }
+    var pickingWhitelist by remember { mutableStateOf(false) }
+    var pickingMasters by remember { mutableStateOf(false) }
     var editor by remember { mutableStateOf<EditorSpec?>(null) }
     var selectedTab by remember { mutableIntStateOf(0) }
 
@@ -158,6 +109,8 @@ fun SettingsScreen() {
                 snapshot = result
                 lifeSnapshot = ConversationClient.peekLifeSnapshot(context)
                 refreshing = false
+                // 微信内如果通过 #认主 修改了配置，同步拉取最新 Config
+                cfg = Prefs.load(context)
                 if (showToast) {
                     snackbarHostState.showSnackbar(
                         if (result.error != null) "同步失败" else "已同步微信会话与生命状态（${result.items.size} 个会话）"
@@ -169,6 +122,7 @@ fun SettingsScreen() {
 
     val refreshLifeOnly: () -> Unit = {
         lifeSnapshot = ConversationClient.peekLifeSnapshot(context)
+        cfg = Prefs.load(context)
         refresh(true)
     }
 
@@ -186,7 +140,12 @@ fun SettingsScreen() {
                         val result = AiClient.complete(request, "你好，现在在忙什么呢？")
                         val text = result.text
                         if (!text.isNullOrBlank()) {
-                            "连接成功，她回复：${text.replace("||", " / ").take(50)}"
+                            val cacheNote = if (result.promptTokens > 0) {
+                                " (缓存 ${result.cacheHitTokens}/${result.promptTokens})"
+                            } else {
+                                ""
+                            }
+                            "连接成功$cacheNote：${text.replace("||", " / ").take(45)}"
                         } else {
                             "连接失败：${result.error ?: "未知错误"}"
                         }
@@ -242,7 +201,7 @@ fun SettingsScreen() {
                         Column {
                             Text("微信 AI · 完整的一生")
                             Text(
-                                text = "数字生命记忆引擎 & WeKit 全能操控中枢 v$moduleVersion",
+                                text = "KV-Cache 长记忆引擎 & 全能微信操控 v$moduleVersion",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -262,8 +221,9 @@ fun SettingsScreen() {
                         onClick = {
                             selectedTab = 0
                             lifeSnapshot = ConversationClient.peekLifeSnapshot(context)
+                            cfg = Prefs.load(context)
                         },
-                        text = { Text("✨ 灵魂与一生") },
+                        text = { Text("✨ 记忆与一生") },
                     )
                     Tab(
                         selected = selectedTab == 1,
@@ -291,15 +251,12 @@ fun SettingsScreen() {
                 0 -> SoulAndLifeTab(
                     cfg = cfg,
                     life = lifeSnapshot,
+                    snapshot = snapshot,
                     refreshing = refreshing,
                     update = update,
                     edit = { spec -> editor = spec },
+                    onPickMasters = { pickingMasters = true },
                     onRefreshLife = refreshLifeOnly,
-                    onPresetApplied = { presetName ->
-                        scope.launch {
-                            snackbarHostState.showSnackbar("已切换灵魂预设：$presetName")
-                        }
-                    },
                 )
 
                 1 -> AgentAndPolicyTab(
@@ -308,7 +265,8 @@ fun SettingsScreen() {
                     refreshing = refreshing,
                     update = update,
                     edit = { spec -> editor = spec },
-                    onManageWhitelist = { picking = true },
+                    onPickMasters = { pickingMasters = true },
+                    onManageWhitelist = { pickingWhitelist = true },
                     onRefreshWhitelist = { refresh(true) },
                 )
 
@@ -327,7 +285,7 @@ fun SettingsScreen() {
         }
     }
 
-    if (picking) {
+    if (pickingWhitelist) {
         ConversationPicker(
             initialSelected = cfg.whitelist.toSet(),
             snapshot = snapshot,
@@ -335,9 +293,36 @@ fun SettingsScreen() {
             onRefresh = { refresh(true) },
             onConfirm = { selected ->
                 update { it.copy(whitelist = selected) }
-                picking = false
+                pickingWhitelist = false
             },
-            onDismiss = { picking = false },
+            onDismiss = { pickingWhitelist = false },
+        )
+    }
+
+    if (pickingMasters) {
+        val currentMasterSet = remember(cfg.masterTalkers) {
+            cfg.masterTalkers.split(',', '，', ';', '；')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .toSet()
+        }
+        ConversationPicker(
+            initialSelected = currentMasterSet,
+            snapshot = snapshot,
+            refreshing = refreshing,
+            onRefresh = { refresh(true) },
+            onConfirm = { selectedWxids ->
+                // 同时将选中主人的会话自动加入白名单，确保主人发消息直接响应
+                val mergedWhitelist = (cfg.whitelist + selectedWxids).distinct()
+                update {
+                    it.copy(
+                        masterTalkers = selectedWxids.joinToString(", "),
+                        whitelist = mergedWhitelist,
+                    )
+                }
+                pickingMasters = false
+            },
+            onDismiss = { pickingMasters = false },
         )
     }
 
@@ -394,23 +379,40 @@ fun SettingsScreen() {
 }
 
 // ============================================================================
-// Tab 0: 灵魂与一生 (数字生命仪表盘、人设模板、好感度图谱、人生日记、永久记忆)
+// Tab 0: 记忆与一生 (实时心境、主人身份、好感度图谱、人生日记、永久记忆)
 // ============================================================================
 
 @Composable
 private fun SoulAndLifeTab(
     cfg: Config,
     life: SessionManager.LifeSnapshot,
+    snapshot: ConvSnapshot,
     refreshing: Boolean,
     update: (((Config) -> Config)) -> Unit,
     edit: (EditorSpec) -> Unit,
+    onPickMasters: () -> Unit,
     onRefreshLife: () -> Unit,
-    onPresetApplied: (String) -> Unit,
 ) {
     val self = life.selfState
 
-    // 1. 她的实时心境与生理状态卡片
-    SettingsCard(title = "她的实时心境与生活状态") {
+    val masterDisplay = remember(cfg.masterTalkers, snapshot) {
+        val raw = cfg.masterTalkers.trim()
+        if (raw.isEmpty()) {
+            "尚未绑定（点此从微信列表选择，或在微信发 #认主 自动绑定）"
+        } else {
+            val nameMap = snapshot.items.associate { it.username to it.name }
+            raw.split(',', '，', ';', '；')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .joinToString("、") { token ->
+                    val mapped = nameMap[token]
+                    if (!mapped.isNullOrBlank() && mapped != token) "$mapped ($token)" else token
+                }
+        }
+    }
+
+    // 1. 实时心境与状态卡片
+    SettingsCard(title = "实时心境与自我状态") {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -431,7 +433,7 @@ private fun SoulAndLifeTab(
                     )
                     Spacer(Modifier.height(2.dp))
                     Text(
-                        text = "正在做：${self.activity}",
+                        text = "当前状态：${self.activity}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.primary,
                     )
@@ -449,7 +451,6 @@ private fun SoulAndLifeTab(
                 }
             }
 
-            // 精力值进度条
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -469,14 +470,13 @@ private fun SoulAndLifeTab(
                 )
             }
 
-            // 内心独白气泡
             Surface(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(12.dp),
                 color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.55f),
             ) {
                 Text(
-                    text = "💭 内心独白：「${self.monologue.ifBlank { "今天会遇到什么有趣的故事呢？" }}」",
+                    text = "💭 内心独白：「${self.monologue.ifBlank { "随时待命，记录每一次对话与故事。" }}」",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSecondaryContainer,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
@@ -484,91 +484,32 @@ private fun SoulAndLifeTab(
             }
 
             Text(
-                text = "累计对话记忆 ${life.totalMessagesCount} 条 · 社交档案 ${life.dossiers.size} 人 · 日记 ${life.diaries.size} 篇 · 永久记忆 ${life.memories.size} 条",
+                text = "累计对话消息 ${life.totalMessagesCount} 条 · 社交档案 ${life.dossiers.size} 人 · 日记 ${life.diaries.size} 篇 · 永久记忆 ${life.memories.size} 条",
                 style = MaterialTheme.typography.labelSmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
 
-    // 2. 灵魂身世与人格预设卡片
+    // 2. 主人绑定与表达设定卡片（无预设虚构人设）
     val bioPreview = remember(cfg.personaBiography) {
-        val compact = cfg.personaBiography.trim().lineSequence().filter { it.isNotBlank() }.take(3).joinToString("\n")
-        if (compact.length > 140) compact.take(140) + "…" else compact
+        if (cfg.personaBiography.isBlank()) {
+            "未设置（默认不加载任何虚构人设，点此可自定义背景设定）"
+        } else {
+            val compact = cfg.personaBiography.trim().lineSequence().filter { it.isNotBlank() }.take(3).joinToString("\n")
+            if (compact.length > 140) compact.take(140) + "…" else compact
+        }
     }
     val promptPreview = remember(cfg.systemPrompt) {
         val compact = cfg.systemPrompt.trim().lineSequence().filter { it.isNotBlank() }.take(2).joinToString("\n")
         if (compact.length > 110) compact.take(110) + "…" else compact
     }
 
-    SettingsCard(title = "灵魂身世与人格设定") {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 18.dp, vertical = 6.dp),
-        ) {
-            Text(
-                text = "一键切换灵魂预设",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurface,
-            )
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                for (preset in PERSONA_PRESETS.take(2)) {
-                    PresetPill(
-                        preset = preset,
-                        modifier = Modifier.weight(1f),
-                        onClick = {
-                            update {
-                                it.copy(
-                                    personaBiography = preset.biography,
-                                    systemPrompt = preset.systemPrompt,
-                                )
-                            }
-                            onPresetApplied(preset.label)
-                        },
-                    )
-                }
-            }
-            Spacer(Modifier.height(8.dp))
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                for (preset in PERSONA_PRESETS.drop(2)) {
-                    PresetPill(
-                        preset = preset,
-                        modifier = Modifier.weight(1f),
-                        onClick = {
-                            update {
-                                it.copy(
-                                    personaBiography = preset.biography,
-                                    systemPrompt = preset.systemPrompt,
-                                )
-                            }
-                            onPresetApplied(preset.label)
-                        },
-                    )
-                }
-            }
-        }
-
+    SettingsCard(title = "唯一主人绑定与性格设定") {
         ValueRow(
-            title = "身世自传与性格底色（完整的一生）",
-            value = bioPreview,
-            onClick = {
-                edit(
-                    EditorSpec.Text(
-                        title = "身世自传与性格底色",
-                        initial = cfg.personaBiography,
-                        multiline = true,
-                        onApply = { value -> update { it.copy(personaBiography = value) } },
-                    )
-                )
-            },
+            title = "唯一主人（从微信会话列表点选）",
+            value = masterDisplay,
+            onClick = onPickMasters,
         )
         ValueRow(
             title = "微信聊天表达守则（System Prompt）",
@@ -584,6 +525,21 @@ private fun SoulAndLifeTab(
                 )
             },
         )
+        ValueRow(
+            title = "自定义背景设定（可选，留空即无预设人设）",
+            value = bioPreview,
+            onClick = {
+                edit(
+                    EditorSpec.Text(
+                        title = "自定义背景设定（留空则不强加任何虚构人设）",
+                        initial = cfg.personaBiography,
+                        multiline = true,
+                        placeholder = "留空即可；或填入你希望赋予TA的自定义身份背景",
+                        onApply = { value -> update { it.copy(personaBiography = value.trim()) } },
+                    )
+                )
+            },
+        )
     }
 
     // 3. 社交关系与好感度图谱
@@ -591,7 +547,7 @@ private fun SoulAndLifeTab(
         if (life.dossiers.isEmpty()) {
             SettingRow(
                 title = "尚无人物好感度档案",
-                subtitle = "当她在微信里与好友或群友聊满 ${cfg.autoReflectionTurns} 轮（或主动触发工具）时，会自动生成对每个人的好感度与性格印象。也可在微信发 #好感度 查看。",
+                subtitle = "在微信发送 #认主 会自动建立「唯一主人 (100/100)」档案；日常聊满 ${cfg.autoReflectionTurns} 轮也会自动生成对每个人的好感度与性格印象。",
             )
         } else {
             Column(
@@ -600,19 +556,19 @@ private fun SoulAndLifeTab(
                     .padding(horizontal = 18.dp, vertical = 6.dp),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                for (d in life.dossiers.take(12)) {
+                for (d in life.dossiers.take(15)) {
                     DossierItemCard(d)
                 }
             }
         }
     }
 
-    // 4. 她的人生日记本
-    SettingsCard(title = "她的人生日记本 (${life.diaries.size})") {
+    // 4. 人生日记本
+    SettingsCard(title = "第一人称人生日记 (${life.diaries.size})") {
         if (life.diaries.isEmpty()) {
             SettingRow(
-                title = "日记本还是空白的",
-                subtitle = "她会在经历有趣或重要的微信对话后，自动以第一人称写下心情日记（在微信里发 #日记 可让她直接念给你听）。",
+                title = "日记本暂无记录",
+                subtitle = "经历有趣或重要的微信对话后会自动写下第一人称日记（在微信发 #日记 可直接查看）。",
             )
         } else {
             val fmt = remember { SimpleDateFormat("MM-dd HH:mm", Locale.CHINA) }
@@ -659,11 +615,11 @@ private fun SoulAndLifeTab(
     }
 
     // 5. 永久记忆库
-    SettingsCard(title = "跨对话永久记忆碎片 (${life.memories.size})") {
+    SettingsCard(title = "跨对话永久事实记忆 (${life.memories.size})") {
         if (life.memories.isEmpty()) {
             SettingRow(
                 title = "暂无永久事实记忆",
-                subtitle = "聊天中提到的生日、喜好、约定、重要身份会被她自动提炼并永久铭记。",
+                subtitle = "聊天中提到的重要事实、约定、身份会被自动提炼并永久铭记。",
             )
         } else {
             Column(
@@ -672,7 +628,7 @@ private fun SoulAndLifeTab(
                     .padding(horizontal = 18.dp, vertical = 6.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                for (m in life.memories.take(15)) {
+                for (m in life.memories.take(20)) {
                     Text(
                         text = "• [${if (m.scope == "global") "全局" else m.scope}] ${m.fact}",
                         style = MaterialTheme.typography.bodySmall,
@@ -680,37 +636,6 @@ private fun SoulAndLifeTab(
                     )
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun PresetPill(
-    preset: PersonaPreset,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit,
-) {
-    Surface(
-        modifier = modifier
-            .clip(RoundedCornerShape(14.dp))
-            .clickable(onClick = onClick),
-        shape = RoundedCornerShape(14.dp),
-        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
-    ) {
-        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-            Text(
-                text = preset.label,
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
-            Text(
-                text = preset.subtitle,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
         }
     }
 }
@@ -761,7 +686,7 @@ private fun DossierItemCard(d: SessionManager.ContactDossier) {
 }
 
 // ============================================================================
-// Tab 1: 操控与策略 (12 大微信 Agent 工具、拟人多气泡、白名单与频率限制)
+// Tab 1: 操控与策略 (主人特权、Prefix KV Cache 长上下文、防抖聚合、白名单)
 // ============================================================================
 
 @Composable
@@ -771,25 +696,31 @@ private fun AgentAndPolicyTab(
     refreshing: Boolean,
     update: (((Config) -> Config)) -> Unit,
     edit: (EditorSpec) -> Unit,
+    onPickMasters: () -> Unit,
     onManageWhitelist: () -> Unit,
     onRefreshWhitelist: () -> Unit,
 ) {
-    SettingsCard(title = "全能微信 Agent 操控中枢（12 大工具）") {
+    SettingsCard(title = "主人身份识别与全能微信 Agent（12 大工具）") {
         SwitchRow(
             title = "启用全能微信 Agent 工具流",
-            subtitle = "赋予她跨对话发消息、查历史记录、拍一拍、引用回复、发名片、撤回消息与发朋友圈的能力",
+            subtitle = "支持跨会话代发消息、查聊天记录、全库搜消息、拍一拍、引用回复、发名片、撤回消息与发朋友圈",
             checked = cfg.enableAgentTools,
             onCheckedChange = { value -> update { it.copy(enableAgentTools = value) } },
         )
         ValueRow(
-            title = "主人特权标识（谁能指挥她跨会话操控）",
-            value = cfg.masterTalkers.ifBlank { "未限制（白名单内均可触发操控）" },
+            title = "从微信会话列表选择主人",
+            value = cfg.masterTalkers.ifBlank { "未绑定（点此从微信列表勾选你的微信号，或在微信发 #认主）" },
+            onClick = onPickMasters,
+        )
+        ValueRow(
+            title = "手动编辑主人标识（wxid 或备注/昵称）",
+            value = cfg.masterTalkers.ifBlank { "留空则白名单内均可触发工具；填你的标识则仅主人拥有跨群操控权" },
             onClick = {
                 edit(
                     EditorSpec.Text(
-                        title = "主人标识（填你的微信昵称、备注或 wxid，逗号分隔）",
+                        title = "主人标识（wxid 或昵称，逗号分隔）",
                         initial = cfg.masterTalkers,
-                        placeholder = "留空则白名单内均可触发；填你的名字则仅你能指挥她跨群操控",
+                        placeholder = "也可直接在微信聊天中发送 #认主 自动绑定",
                         onApply = { value -> update { it.copy(masterTalkers = value.trim()) } },
                     )
                 )
@@ -803,66 +734,45 @@ private fun AgentAndPolicyTab(
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text(
-                text = "已挂载的 12 项微信原生动作与快捷指令：",
+                text = "三大交互方式与快捷指令：",
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary,
             )
             Text(
-                text = "• 跨会话操控：搜索好友/群聊、跨群代发消息、读取任意群聊/私聊记录、读取群成员名单、全库搜索聊天记录",
+                text = "1. 微信内认主：用你的微信号给TA发一句「#认主」（或在群里 @TA #认主），即可一键绑定为唯一主人(好感度100)。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                text = "• 原生互动：拍一拍头像 (send_pat)、引用消息回复 (send_quote_reply)、发好友名片 (send_contact_card)、撤回消息、发微信朋友圈",
+                text = "2. 文件传输助手直通：将「文件传输助手」勾选进白名单后，直接在文件传输助手打字即可免前缀指挥TA。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                text = "• 机主召唤指令：在任意聊天窗口自己发出「@ai 帮我给xxx发消息说…」「#状态」「#日记」「#好感度」「#记忆」「#重置」即可直接触发",
+                text = "3. 快捷指令：支持「@ai 帮我给xxx发消息…」「#认主」「#状态」「#日记」「#好感度」「#记忆」「#重置」。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
 
-    SettingsCard(title = "拟人表达与生命演化策略") {
+    SettingsCard(title = "长上下文与 Prefix KV 缓存优化") {
         SwitchRow(
-            title = "真人多气泡分段发送",
-            subtitle = "将长句或 || 分隔的多句回复拆成 2~3 个微信气泡依次发出，并根据字数模拟真人打字停顿",
-            checked = cfg.enableMultiBubble,
-            onCheckedChange = { value -> update { it.copy(enableMultiBubble = value) } },
-        )
-        SwitchRow(
-            title = "启用多轮上下文与长期记忆",
-            subtitle = "SQLite 持久化会话历史、好感度图谱、人生日记与长期事实",
+            title = "启用多轮记忆与分块 KV 缓存锚定",
+            subtitle = "保持 System Prompt 与历史前缀 100% 静态追加，DeepSeek 缓存命中率可达 90%+，大幅降低延迟与 Token 消耗",
             checked = cfg.enableMemory,
             onCheckedChange = { value -> update { it.copy(enableMemory = value) } },
         )
         ValueRow(
-            title = "后台自动反思与写日记间隔",
-            value = if (cfg.autoReflectionTurns <= 0) "已关闭自动反思" else "每聊满 ${cfg.autoReflectionTurns} 轮自动反思心境、更新好感度与日记",
+            title = "单会话长上下文轮数",
+            value = "${cfg.maxHistoryTurns} 轮（保留 ${cfg.maxHistoryTurns * 2} 条消息，分块滚动不破坏缓存）",
             onClick = {
                 edit(
                     EditorSpec.Number(
-                        title = "自动反思轮数间隔（0 = 关闭）",
-                        initial = cfg.autoReflectionTurns,
-                        min = 0,
-                        max = 30,
-                        onApply = { value -> update { it.copy(autoReflectionTurns = value) } },
-                    )
-                )
-            },
-        )
-        ValueRow(
-            title = "短期多轮上下文轮数",
-            value = "${cfg.maxHistoryTurns} 轮（最多保留 ${cfg.maxHistoryTurns * 2} 条上下文）",
-            onClick = {
-                edit(
-                    EditorSpec.Number(
-                        title = "多轮上下文保留轮数",
+                        title = "多轮上下文保留轮数（10 ~ 500 轮）",
                         initial = cfg.maxHistoryTurns,
-                        min = 1,
-                        max = 50,
+                        min = 10,
+                        max = 500,
                         onApply = { value -> update { it.copy(maxHistoryTurns = value) } },
                     )
                 )
@@ -870,11 +780,11 @@ private fun AgentAndPolicyTab(
         )
         ValueRow(
             title = "会话超时分割",
-            value = if (cfg.sessionExpireMinutes <= 0) "永不过期" else "${cfg.sessionExpireMinutes} 分钟不聊开启新话题",
+            value = if (cfg.sessionExpireMinutes <= 0) "0 分钟（永不断片，跨天保持完整上下文与缓存）" else "${cfg.sessionExpireMinutes} 分钟不聊开启新窗口",
             onClick = {
                 edit(
                     EditorSpec.Number(
-                        title = "会话超时分钟数（0 = 永不过期）",
+                        title = "会话超时分钟数（推荐填 0 = 永不断片）",
                         initial = cfg.sessionExpireMinutes,
                         min = 0,
                         max = 10080,
@@ -882,6 +792,27 @@ private fun AgentAndPolicyTab(
                     )
                 )
             },
+        )
+        ValueRow(
+            title = "后台静默反思与写日记间隔",
+            value = if (cfg.autoReflectionTurns <= 0) "已关闭自动反思" else "每聊满 ${cfg.autoReflectionTurns} 轮自动更新心境、好感度与日记",
+            onClick = {
+                edit(
+                    EditorSpec.Number(
+                        title = "自动反思轮数间隔（0 = 关闭）",
+                        initial = cfg.autoReflectionTurns,
+                        min = 0,
+                        max = 50,
+                        onApply = { value -> update { it.copy(autoReflectionTurns = value) } },
+                    )
+                )
+            },
+        )
+        SwitchRow(
+            title = "真人多气泡分段发送",
+            subtitle = "将 || 分隔或多行短句拆成 2~3 个微信气泡依次发出，模拟真人打字停顿",
+            checked = cfg.enableMultiBubble,
+            onCheckedChange = { value -> update { it.copy(enableMultiBubble = value) } },
         )
     }
 
@@ -893,16 +824,16 @@ private fun AgentAndPolicyTab(
         onRefresh = onRefreshWhitelist,
     )
 
-    SettingsCard(title = "群聊触发与频率保护") {
+    SettingsCard(title = "防抖聚合与群聊触发策略") {
         ValueRow(
-            title = "我的微信昵称",
-            value = cfg.myNickname,
+            title = "我的微信昵称（留空自动读取本机微信号昵称）",
+            value = cfg.myNickname.ifBlank { "自动识别当前登录微信号昵称" },
             onClick = {
                 edit(
                     EditorSpec.Text(
-                        title = "我的微信昵称（用于识别群聊 @我）",
+                        title = "我的微信昵称（留空则自动从微信数据库读取）",
                         initial = cfg.myNickname,
-                        placeholder = "用于识别群聊里的 @我",
+                        placeholder = "留空即可自动识别群聊 @我",
                         onApply = { value -> update { it.copy(myNickname = value.trim()) } },
                     )
                 )
@@ -910,17 +841,32 @@ private fun AgentAndPolicyTab(
         )
         SwitchRow(
             title = "群里只有被 @ 才回复",
-            subtitle = "群聊里仅当消息包含 @我的昵称 时才触发回复",
+            subtitle = "群聊被 @ 时会自动附带群内刚才大家的聊天背景，不会答非所问",
             checked = cfg.groupOnlyWhenMentioned,
             onCheckedChange = { value -> update { it.copy(groupOnlyWhenMentioned = value) } },
         )
         ValueRow(
-            title = "同一会话冷却时间",
+            title = "连发消息防抖合并等待区间",
+            value = "${cfg.replyDelayMinMs} ~ ${cfg.replyDelayMaxMs} 毫秒（对方连发多句自动合并为一轮）",
+            onClick = {
+                edit(
+                    EditorSpec.Delay(
+                        initialMin = cfg.replyDelayMinMs,
+                        initialMax = cfg.replyDelayMaxMs,
+                        onApply = { min, max ->
+                            update { it.copy(replyDelayMinMs = min, replyDelayMaxMs = max) }
+                        },
+                    )
+                )
+            },
+        )
+        ValueRow(
+            title = "两次回复最小间隔（平滑等待不丢消息）",
             value = "${cfg.cooldownSeconds} 秒",
             onClick = {
                 edit(
                     EditorSpec.Number(
-                        title = "冷却时间（秒）",
+                        title = "最小间隔（秒）",
                         initial = cfg.cooldownSeconds,
                         min = 0,
                         max = 3600,
@@ -955,21 +901,6 @@ private fun AgentAndPolicyTab(
                         min = 1,
                         max = 10000,
                         onApply = { value -> update { it.copy(maxReplyChars = value) } },
-                    )
-                )
-            },
-        )
-        ValueRow(
-            title = "首条气泡随机延迟区间",
-            value = "${cfg.replyDelayMinMs} ~ ${cfg.replyDelayMaxMs} 毫秒",
-            onClick = {
-                edit(
-                    EditorSpec.Delay(
-                        initialMin = cfg.replyDelayMinMs,
-                        initialMax = cfg.replyDelayMaxMs,
-                        onApply = { min, max ->
-                            update { it.copy(replyDelayMinMs = min, replyDelayMaxMs = max) }
-                        },
                     )
                 )
             },
@@ -1043,7 +974,7 @@ private fun StatusCard(
             subtitleColor = versionColor,
         )
         SwitchRow(
-            title = "启用数字生命自动回复",
+            title = "启用自动回复与 Agent 操控",
             subtitle = "关闭后微信内暂停一切自动回复与工具调用",
             checked = enabled,
             onCheckedChange = onEnabledChange,
@@ -1109,8 +1040,8 @@ private fun AiServiceCard(
             onChange = { value -> update { it.copy(temperature = value) } },
         )
         SettingRow(
-            title = "测试连接并打招呼",
-            subtitle = "用当前灵魂设定向接口发一条「你好，现在在忙什么呢？」",
+            title = "测试连接并查看缓存状态",
+            subtitle = "用当前设定向接口发一条「你好，现在在忙什么呢？」",
             onClick = { if (!testing) onTest() },
             trailing = {
                 if (testing) {
@@ -1260,14 +1191,14 @@ private fun DebugCard(
 ) {
     SettingsCard(title = "调试与关于") {
         SwitchRow(
-            title = "调试日志与 Toast 提示",
-            subtitle = "让微信进程把触发、Agent 工具调用与发送细节写入 Xposed 日志并弹出提示",
+            title = "调试日志与缓存命中率 Toast 提示",
+            subtitle = "回复后在 Toast 和 Xposed 日志中显示本次 Prefix KV Cache 命中百分比",
             checked = debug,
             onCheckedChange = onDebugChange,
         )
         InfoRow(title = "模块版本", value = moduleVersion)
         InfoRow(title = "支持的微信版本", value = DexMap.SUPPORTED_VERSION_NAME)
-        InfoRow(title = "底层操控引擎", value = "SQLite Hook + WeKit Bridge")
+        InfoRow(title = "底层操控引擎", value = "SQLite Hook + WeKit Bridge + KV-Cache Anchor")
     }
 }
 
@@ -1279,9 +1210,9 @@ private fun formatTime(timestamp: Long): String = try {
 
 @Suppress("DEPRECATION")
 private fun moduleVersionName(context: android.content.Context): String = try {
-    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.0.0"
+    context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "2.1.0"
 } catch (_: Throwable) {
-    "2.0.0"
+    "2.1.0"
 }
 
 /**

@@ -1,6 +1,7 @@
 package dev.cheng.wxai
 
 import android.content.BroadcastReceiver
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -9,10 +10,10 @@ import android.os.Build
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 微信进程侧读取配置：
+ * 微信进程侧读取与回写配置：
  * 1. 启动期只加载微信自身 SharedPreferences("wxai_mirror_config") 与注册 ACTION_CONFIG_UPDATED 广播；
- * 2. 启动期绝不主动发起跨进程 ContentProvider 查询，彻底消除启动期 Binder / AMS 锁竞争；
- * 3. 仅当首次收到新消息且本地无镜像时，才在后台工作线程按需拉取一次 ContentProvider。
+ * 2. 仅当首次收到新消息且本地无镜像时，才在后台工作线程按需拉取一次 ContentProvider；
+ * 3. 支持在微信内执行 #认主 等指令时直接修改配置并回写至模块 App。
  */
 object ConfigBridge {
     private const val AUTHORITY = "dev.cheng.wxai.config"
@@ -51,6 +52,27 @@ object ConfigBridge {
             return m
         }
         return Config.DEFAULT
+    }
+
+    /**
+     * 在微信进程内更新配置（如执行 #认主 指令时自动绑定主人 wxid）并同步回模块 App。
+     */
+    fun updateFromWechat(ctx: Context, transform: (Config) -> Config): Config {
+        val app = ctx.applicationContext ?: ctx
+        val current = ensureLoadedOnWorker(app)
+        val updated = transform(current)
+        val raw = updated.toJson().toString()
+        cached = updated
+        saveMirror(app, raw)
+        try {
+            val cv = ContentValues().apply {
+                put(ConfigProvider.COLUMN_JSON, raw)
+            }
+            app.contentResolver.update(Uri.parse("content://$AUTHORITY/config"), cv, null, null)
+        } catch (t: Throwable) {
+            L.w("push config to provider skipped: ${t.message}")
+        }
+        return updated
     }
 
     /**

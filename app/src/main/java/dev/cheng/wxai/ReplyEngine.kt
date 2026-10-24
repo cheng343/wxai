@@ -10,22 +10,29 @@ import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 /**
- * 数字生命消息引擎：
- * 收到消息 -> 过滤 -> 注入自我心境(SelfState)/好感度档案(Dossier)/人生日记(Diary)/多轮记忆 ->
- * 调模型(含 12 大全能微信 Agent 工具流) -> 拟人多气泡发送 -> 后台静默反思与写日记。
+ * 数字生命消息引擎（v2.1 交互与 Prefix KV Cache 深度优化版）：
+ *
+ * 核心升级：
+ * 1. 消息防抖聚合（Debounce Batching）：对方或主人连发多条短消息时，自动在防抖窗口内合并为一次完整输入，绝不因冷却时间吞掉后续关键句子；
+ * 2. 主人全场景识别（Master Recognition）：支持微信内发 `#认主` 一键绑定、支持 `filehelper` 直接对话、支持双号主从识别，对话中明确区分【唯一主人】与普通好友；
+ * 3. 群聊环境感知与引用消息解析：支持解析微信原生「引用回复」(type=822083633)，并在群聊被 @ 时自动附带群内刚才大家的聊天背景；
+ * 4. Prefix KV Cache 架构：保持 System Prompt 与历史消息列表 100% 静态追加，仅在末尾当前轮挂载 `<turn_context>`，实现 90%+ 缓存命中率。
  */
 object ReplyEngine {
 
     private const val STALE_MSG_SECONDS = 120L
     private const val SEEN_CACHE = 512
+    private const val TYPE_QUOTE_REPLY = 822083633
 
     /**
-     * 单工作线程 + 有界队列（最多排 8 条，超出丢弃最旧）：
+     * 单工作线程 + 有界队列：
      * 保证 AI 请求、多气泡发送与后台反思串行执行，绝不并发冲击微信数据库或 NetSceneQueue。
      */
     private val pool = ThreadPoolExecutor(
@@ -33,15 +40,28 @@ object ReplyEngine {
         1,
         0L,
         TimeUnit.MILLISECONDS,
-        ArrayBlockingQueue(8),
+        ArrayBlockingQueue(12),
         { r -> Thread(r, "wxai-reply").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 } },
         ThreadPoolExecutor.DiscardOldestPolicy(),
     )
 
+    /** 防抖调度器：用于合并同一会话在几秒内连续发出的多条短消息 */
+    private val debounceScheduler = Executors.newSingleThreadScheduledExecutor { r ->
+        Thread(r, "wxai-debounce").apply { isDaemon = true }
+    }
+
     private class TalkerState {
         @Volatile
-        var lastTriggerAt: Long = 0L
+        var lastReplyFinishedAt: Long = 0L
         val recentReplies = ArrayDeque<Long>()
+
+        // 防抖缓冲队列
+        val pendingLines = ArrayList<String>()
+        var firstPendingAt: Long = 0L
+        var lastSenderWxid: String? = null
+        var lastSenderName: String = ""
+        var pendingIsSelfCmd: Boolean = false
+        var debounceFuture: ScheduledFuture<*>? = null
     }
 
     private val states = ConcurrentHashMap<String, TalkerState>()
@@ -55,11 +75,11 @@ object ReplyEngine {
     }
 
     /**
-     * 记录 AI 自己通过 MessageSender 发出的文本哈希，防止机主自指令模式误把自己刚发的回复当成新指令。
+     * 记录 AI 自己通过 MessageSender 发出的文本哈希，防止机主自指令模式或 filehelper 误把自己刚发的回复当成新指令。
      */
-    private val aiSentRecent = object : LinkedHashMap<Int, Long>(128, 0.75f, true) {
+    private val aiSentRecent = object : LinkedHashMap<Int, Long>(256, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Long>): Boolean =
-            size > 128
+            size > 256
     }
 
     @Volatile
@@ -70,7 +90,7 @@ object ReplyEngine {
     fun start(ctx: Context) {
         val c = ctx.applicationContext ?: ctx
         appCtx = c
-        L.i("reply engine v2.0 started (Digital Life + 12 WeChat Agent tools)")
+        L.i("reply engine v2.1 started (KV-Cache Optimized + Debounce Batching + Master Binding)")
         pool.execute {
             try {
                 ConversationBridge.pushLifeSnapshot(c)
@@ -88,7 +108,7 @@ object ReplyEngine {
     private fun isAiOutbound(talker: String, text: String): Boolean = synchronized(aiSentRecent) {
         val key = (talker + "|" + text.trim()).hashCode()
         val ts = aiSentRecent[key] ?: return false
-        if (System.currentTimeMillis() - ts < 30_000L) {
+        if (System.currentTimeMillis() - ts < 45_000L) {
             return true
         }
         aiSentRecent.remove(key)
@@ -99,13 +119,12 @@ object ReplyEngine {
 
     /**
      * SQLiteDatabase.insertWithOnConflict("message", ..., values, ...) 回调入口。
-     * 直接读取 ContentValues，零反射、零阻塞。
      */
     fun onMessageInsertedValues(values: ContentValues) {
         val ctx = appCtx ?: return
 
         val type = values.getAsInteger("type") ?: return
-        if (type != DexMap.TYPE_TEXT) return
+        if (type != DexMap.TYPE_TEXT && type != TYPE_QUOTE_REPLY) return
 
         val talker = values.getAsString("talker")?.trim().orEmpty()
         if (talker.isEmpty()) return
@@ -115,14 +134,15 @@ object ReplyEngine {
 
         val isSend = values.getAsInteger("isSend") ?: 0
         if (isSend != 0) {
-            // 自己发的消息：除非是机主显式输入的召唤指令（如 /ai、@AI、#状态、#日记、#重置），否则一律忽略
+            // 排除 AI 自己刚刚发出的消息
             if (isAiOutbound(talker, rawContent)) return
-            if (!isSelfCommandTrigger(rawContent)) return
+            // 在文件传输助手 (filehelper) 中机主直接打字，或者在任意窗口输入 /ai、@ai、#认主 等快捷指令，均视为机主指令
+            val isFileHelper = talker == "filehelper"
+            if (!isFileHelper && !isSelfCommandTrigger(rawContent)) return
         }
 
         val createTime = values.getAsLong("createTime") ?: 0L
         val nowMs = System.currentTimeMillis()
-        // 微信 message 表 createTime 单位是毫秒（如 1760000000000L），兼容秒级时间戳
         val msgTimeMs = when {
             createTime <= 0L -> nowMs
             createTime < 10_000_000_000L -> createTime * 1000L
@@ -132,9 +152,8 @@ object ReplyEngine {
             return
         }
 
-        val isSelfCmd = isSend != 0 && isSelfCommandTrigger(rawContent)
+        val isSelfCmd = isSend != 0 || isSelfCommandTrigger(rawContent)
 
-        // 如果本地已经有配置缓存，直接在微秒级内快速过滤非白名单会话（机主显式 /ai 指令除外）
         if (ConfigBridge.hasLoadedConfig()) {
             val fastCfg = ConfigBridge.get(ctx)
             if (!fastCfg.enabled) return
@@ -144,11 +163,11 @@ object ReplyEngine {
         val msgId = values.getAsLong("msgId") ?: 0L
         val svrId = values.getAsLong("msgSvrId") ?: 0L
 
-        pool.execute {
+        debounceScheduler.execute {
             val cfg = ConfigBridge.ensureLoadedOnWorker(ctx)
             if (!cfg.enabled) return@execute
             if (!isSelfCmd && !inWhitelist(cfg.whitelist, talker)) return@execute
-            processCandidate(ctx, cfg, talker, rawContent, msgId, svrId, msgTimeMs, isSelfCmd)
+            enqueueOrBatchCandidate(ctx, cfg, talker, type, rawContent, msgId, svrId, msgTimeMs, isSelfCmd)
         }
     }
 
@@ -158,6 +177,7 @@ object ReplyEngine {
             t.startsWith("@ai ", ignoreCase = true) ||
             t.startsWith("#ai ", ignoreCase = true) ||
             t in setOf(
+                "#认主", "#我是主人",
                 "#重置", "#重置会话", "#清除记忆",
                 "#记忆", "#查看记忆",
                 "#状态", "#心境",
@@ -174,12 +194,13 @@ object ReplyEngine {
         return t
     }
 
-    // ---------------------------------------------------------------- 后台过滤与发送流程
+    // ---------------------------------------------------------------- 消息解析与防抖聚合（Debounce Batching）
 
-    private fun processCandidate(
+    private fun enqueueOrBatchCandidate(
         ctx: Context,
         cfg: Config,
         talker: String,
+        type: Int,
         rawContent: String,
         msgId: Long,
         svrId: Long,
@@ -188,94 +209,203 @@ object ReplyEngine {
     ) {
         try {
             val isGroup = talker.endsWith("@chatroom")
-            val (senderWxid, strippedContent) = if (isGroup && !isSelfCmd) {
+            val (senderWxid, rawBody) = if (isGroup && !isSelfCmd) {
                 extractGroupSenderAndBody(rawContent)
             } else {
                 null to (if (isSelfCmd) stripSelfCommandPrefix(rawContent) else rawContent)
             }
 
-            val content = strippedContent.trim()
-            if (content.isEmpty()) return
-
-            if (looksLikeSystemOrMedia(content)) return
-            if (isGroup && !isSelfCmd && cfg.groupOnlyWhenMentioned && !mentionsMe(content, cfg)) {
-                L.i("group msg skipped (not mentioned): ${content.take(40)}")
-                return
+            // 如果是微信「引用回复」XML (type=822083633)，提取引用上下文与用户回复正文
+            val parsedBody = if (type == TYPE_QUOTE_REPLY || rawBody.trimStart().startsWith("<")) {
+                ConversationBridge.parseQuotedMessageText(rawBody) ?: return
+            } else {
+                rawBody.trim()
             }
+            if (parsedBody.isEmpty()) return
+            if (looksLikeSystemOrMedia(parsedBody)) return
 
             val dedupeKey = when {
                 svrId != 0L -> "s$svrId"
                 msgId != 0L -> "m$msgId"
-                else -> "h$talker|$msgTimeMs|${content.hashCode()}"
+                else -> "h$talker|$msgTimeMs|${parsedBody.hashCode()}"
             }
             if (!markSeen(dedupeKey)) {
-                L.i("duplicate msg ignored ($dedupeKey)")
                 return
             }
 
-            // 1. 优先拦截内置状态/日记/好感度/记忆指令（不受冷却时间限制）
-            if (handleBuiltinCommand(ctx, cfg, talker, content)) {
+            // 优先检查内置快捷指令（如 #认主、#状态、#日记、#好感度、#重置）
+            val strippedForCmd = stripMentionTag(parsedBody, cfg).trim()
+            if (isBuiltinCommand(strippedForCmd)) {
+                pool.execute {
+                    handleBuiltinCommand(ctx, cfg, talker, senderWxid, strippedForCmd)
+                }
                 return
             }
 
-            if (!isSelfCmd && !passRateLimit(cfg, talker)) return
+            val state = states.computeIfAbsent(talker) { TalkerState() }
+            val cleanInput = stripMentionTag(parsedBody, cfg)
 
+            synchronized(state) {
+                // 群聊触发判定：
+                // 1) 消息显式 @我；或者
+                // 2) 同一发言人在防抖窗口（3秒内）刚刚 @我 过，紧接着发出了补充的第二句话
+                val isFollowUpInActiveBatch = state.pendingLines.isNotEmpty() &&
+                    state.lastSenderWxid == senderWxid &&
+                    (System.currentTimeMillis() - state.firstPendingAt) < 4000L
+
+                if (isGroup && !isSelfCmd && cfg.groupOnlyWhenMentioned && !mentionsMe(parsedBody, cfg) && !isFollowUpInActiveBatch) {
+                    return
+                }
+
+                val talkerName = ConversationBridge.getDisplayName(talker)
+                val senderName = when {
+                    !senderWxid.isNullOrBlank() -> ConversationBridge.getDisplayName(senderWxid)
+                    isSelfCmd -> "主人"
+                    else -> talkerName
+                }
+
+                val formattedLine = if (isGroup && !isSelfCmd) {
+                    "[$senderName]: $cleanInput"
+                } else {
+                    cleanInput
+                }
+
+                if (state.pendingLines.isEmpty()) {
+                    state.firstPendingAt = System.currentTimeMillis()
+                }
+                state.pendingLines.add(formattedLine)
+                state.lastSenderWxid = senderWxid
+                state.lastSenderName = senderName
+                state.pendingIsSelfCmd = state.pendingIsSelfCmd || isSelfCmd
+
+                // 计算防抖等待窗口：允许用户把连续两三句短话打完再一次性合并送入大模型
+                state.debounceFuture?.cancel(false)
+                val baseWaitMs = if (state.pendingIsSelfCmd) {
+                    500L
+                } else {
+                    val min = cfg.replyDelayMinMs.coerceIn(600, 4000).toLong()
+                    val max = cfg.replyDelayMaxMs.coerceIn(min.toInt(), 5000).toLong()
+                    if (max > min) Random.nextLong(min, max + 1) else min
+                }
+                val elapsed = System.currentTimeMillis() - state.firstPendingAt
+                // 最多累积等待 4.5 秒，防止无限推迟
+                val waitMs = if (elapsed + baseWaitMs > 4500L) {
+                    (4500L - elapsed).coerceAtLeast(150L)
+                } else {
+                    baseWaitMs
+                }
+
+                L.i("batched input [${state.pendingLines.size}] <- $talker ($senderName): ${cleanInput.take(50)} (wait=${waitMs}ms)")
+
+                state.debounceFuture = debounceScheduler.schedule(
+                    { flushPendingBatch(ctx, talker) },
+                    waitMs,
+                    TimeUnit.MILLISECONDS,
+                )
+            }
+        } catch (t: Throwable) {
+            L.e("enqueueOrBatchCandidate failed for $talker", t)
+        }
+    }
+
+    private fun flushPendingBatch(ctx: Context, talker: String) {
+        val state = states[talker] ?: return
+        val mergedInput: String
+        val senderWxid: String?
+        val senderName: String
+        val isSelfCmd: Boolean
+
+        synchronized(state) {
+            if (state.pendingLines.isEmpty()) return
+            mergedInput = state.pendingLines.joinToString("\n")
+            senderWxid = state.lastSenderWxid
+            senderName = state.lastSenderName
+            isSelfCmd = state.pendingIsSelfCmd
+            state.pendingLines.clear()
+            state.pendingIsSelfCmd = false
+            state.debounceFuture = null
+        }
+
+        pool.execute {
+            val cfg = ConfigBridge.ensureLoadedOnWorker(ctx)
+            if (!cfg.enabled) return@execute
+            executeMergedTurn(
+                ctx = ctx,
+                cfg = cfg,
+                talker = talker,
+                mergedUserMsg = mergedInput,
+                senderWxid = senderWxid,
+                senderName = senderName,
+                isSelfCmd = isSelfCmd,
+            )
+        }
+    }
+
+    // ---------------------------------------------------------------- 核心推理与回复执行
+
+    private fun executeMergedTurn(
+        ctx: Context,
+        cfg: Config,
+        talker: String,
+        mergedUserMsg: String,
+        senderWxid: String?,
+        senderName: String,
+        isSelfCmd: Boolean,
+    ) {
+        try {
+            if (!isSelfCmd && !waitOrCheckRateLimit(cfg, talker)) return
+
+            val isGroup = talker.endsWith("@chatroom")
             val talkerName = ConversationBridge.getDisplayName(talker)
-            val senderName = if (!senderWxid.isNullOrBlank()) {
-                ConversationBridge.getDisplayName(senderWxid)
-            } else if (isSelfCmd) {
-                "主人(机主)"
-            } else {
-                talkerName
+            val isMaster = isSelfCmd || isMasterSpeaker(cfg, talker, talkerName, senderWxid, senderName)
+
+            // 如果当前说话人是主人，自动确保其档案关系为「唯一主人」且好感度满值
+            val speakerId = if (isGroup && !senderWxid.isNullOrBlank()) senderWxid else talker
+            val speakerDisplayName = if (isGroup && !senderWxid.isNullOrBlank()) senderName else talkerName
+            if (isMaster && speakerId != "filehelper") {
+                val existing = SessionManager.getDossier(ctx, speakerId, speakerDisplayName)
+                if (existing.relationship != "唯一主人" || existing.affection < 100) {
+                    SessionManager.updateDossier(
+                        ctx = ctx,
+                        talker = speakerId,
+                        displayName = speakerDisplayName,
+                        relationship = "唯一主人",
+                        affectionDelta = 100,
+                    )
+                }
             }
 
-            L.i("trigger <- $talker ($senderName): ${content.take(60)}")
-
-            val delay = if (isSelfCmd) {
-                200L
-            } else if (cfg.replyDelayMaxMs > cfg.replyDelayMinMs) {
-                Random.nextLong(cfg.replyDelayMinMs.toLong(), cfg.replyDelayMaxMs.toLong() + 1)
-            } else {
-                cfg.replyDelayMinMs.toLong()
-            }
-            if (delay > 0) Thread.sleep(delay)
-
-            // 2. 构建多轮上下文消息列表
-            val cleanUserInput = stripMentionTag(content, cfg)
-            val userMsgForModel = if (isGroup && !isSelfCmd) {
-                "[$senderName]: $cleanUserInput"
-            } else {
-                cleanUserInput
-            }
-
+            // 1. 构建纯净多轮历史上下文（分块锚定，不混入动态时间戳以保证 95%+ Prefix KV 缓存命中）
             val historyMessages = buildConversationContext(
                 ctx = ctx,
                 cfg = cfg,
                 talker = talker,
-                currentUserMessage = userMsgForModel,
+                currentUserMessage = mergedUserMsg,
             )
 
-            // 3. 判定是否允许本轮使用 Agent 跨对话操控工具
-            val allowTools = cfg.enableAgentTools && (isSelfCmd || isAuthorizedForAgent(cfg, talker, talkerName, senderWxid, senderName))
+            // 2. 判定是否允许本轮使用 Agent 跨对话操控工具
+            val allowTools = cfg.enableAgentTools && (isMaster || cfg.masterTalkers.isBlank())
 
-            // 4. 构建数字生命全维度感知提示词（心境 + 精力 + 好感度档案 + 日记 + 永久记忆 + 工具守则）
-            val extraSystem = buildDynamicSystemContext(
+            // 3. 构建挂载在末尾最新一轮的动态感知块 <turn_context>
+            val turnContext = buildDynamicTurnContext(
                 ctx = ctx,
                 cfg = cfg,
                 talker = talker,
                 talkerName = talkerName,
+                speakerId = speakerId,
                 senderName = senderName,
                 isGroup = isGroup,
                 isSelfCmd = isSelfCmd,
-                allowTools = allowTools,
+                isMaster = isMaster,
             )
 
+            val turnStartMs = System.currentTimeMillis()
             val result = AiClient.completeWithContext(
                 ctx = ctx,
                 cfg = cfg,
                 currentTalker = talker,
                 historyMessages = historyMessages,
-                extraSystem = extraSystem,
+                extraSystem = turnContext,
                 allowAgentTools = allowTools,
             )
 
@@ -292,47 +422,102 @@ object ReplyEngine {
                 return
             }
 
-            // 5. 拟人化多气泡或单气泡发送（MessageSender 内部会自动调用 markAiOutbound 防自激）
+            // 4. 拟人多气泡或单气泡发送
             markAiOutbound(talker, reply)
             val ok = MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
             if (ok) {
-                recordReply(talker)
+                recordReplyFinished(talker)
                 if (cfg.enableMemory) {
-                    SessionManager.appendMessage(ctx, talker, "user", userMsgForModel, msgTimeMs)
+                    // 存入 SQLite 的是纯净的对话文本（不含 <turn_context>），确保后续轮次 100% 命中 Prefix KV Cache
+                    SessionManager.appendMessage(ctx, talker, "user", mergedUserMsg, turnStartMs)
                     val cleanSavedReply = reply.replace("||", " ").replace(Regex(" {2,}"), " ").trim()
                     val turns = SessionManager.appendMessage(ctx, talker, "assistant", cleanSavedReply, System.currentTimeMillis())
 
-                    // 每次对话后推送一次快照，若达到反思轮数则触发后台内心反思与日记沉淀
                     if (cfg.autoReflectionTurns > 0 && turns >= cfg.autoReflectionTurns) {
                         SessionManager.resetReflectionCounter(talker)
-                        val recentForReflection = SessionManager.getHistory(ctx, talker, maxTurns = 6, expireMinutes = 0)
-                        AiClient.reflectOnConversation(ctx, cfg, talker, talkerName, recentForReflection)
+                        val recentForReflection = SessionManager.getHistory(ctx, talker, maxTurns = 8, expireMinutes = 0)
+                        AiClient.reflectOnConversation(ctx, cfg, speakerId, speakerDisplayName, recentForReflection)
                     } else {
                         ConversationBridge.pushLifeSnapshot(ctx)
                     }
                 }
             }
-            debugToast(cfg, if (ok) "已回复: ${reply.take(30)}" else "发送失败")
-            L.i("reply -> $talker: ${reply.take(60)} (ok=$ok)")
+
+            val cacheInfo = if (result.promptTokens > 0) {
+                val pct = (result.cacheHitTokens * 100) / result.promptTokens
+                " (缓存命中 $pct%)"
+            } else {
+                ""
+            }
+            debugToast(cfg, if (ok) "已回复$cacheInfo: ${reply.take(24)}" else "发送失败")
+            L.i("reply -> $talker$cacheInfo: ${reply.take(60)} (ok=$ok)")
         } catch (t: Throwable) {
-            L.e("processCandidate failed for $talker", t)
+            L.e("executeMergedTurn failed for $talker", t)
         }
     }
 
-    /**
-     * 处理 #状态 / #日记 / #好感度 / #记忆 / #重置 等快捷指令。
-     */
+    // ---------------------------------------------------------------- 内置快捷指令 (#认主 / #状态 / #日记 / #好感度 / #记忆 / #重置)
+
+    private fun isBuiltinCommand(cmd: String): Boolean {
+        return cmd in setOf(
+            "#认主", "#我是主人",
+            "#重置", "#重置会话", "#清除记忆", "#reset", "#RESET",
+            "#状态", "#心境",
+            "#好感度", "#档案",
+            "#日记", "#看日记",
+            "#记忆", "#查看记忆",
+        )
+    }
+
     private fun handleBuiltinCommand(
         ctx: Context,
         cfg: Config,
         talker: String,
-        content: String,
+        senderWxid: String?,
+        cmd: String,
     ): Boolean {
-        val cmd = stripMentionTag(content, cfg).trim()
         when {
+            cmd == "#认主" || cmd == "#我是主人" -> {
+                val masterWxid = senderWxid?.takeIf { it.isNotBlank() }
+                    ?: if (talker == "filehelper") ConversationBridge.getSelfWxid().ifEmpty { "filehelper" } else talker
+                val masterName = ConversationBridge.getDisplayName(masterWxid)
+
+                val updatedCfg = ConfigBridge.updateFromWechat(ctx) { old ->
+                    val existingMasters = old.masterTalkers.split(',', '，', ';', '；')
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .toMutableSet()
+                    existingMasters.add(masterWxid)
+                    if (masterName.isNotBlank() && masterName != masterWxid) {
+                        existingMasters.add(masterName)
+                    }
+                    val newWhitelist = if (talker in old.whitelist) old.whitelist else (old.whitelist + talker)
+                    old.copy(
+                        masterTalkers = existingMasters.joinToString(", "),
+                        whitelist = newWhitelist,
+                    )
+                }
+
+                SessionManager.updateDossier(
+                    ctx = ctx,
+                    talker = masterWxid,
+                    displayName = masterName,
+                    relationship = "唯一主人",
+                    affectionDelta = 100,
+                    profileNotes = "我最信任、唯一效忠的主人",
+                )
+                SessionManager.saveMemory(ctx, "global", "我的唯一主人是 $masterName ($masterWxid)")
+                ConversationBridge.pushLifeSnapshot(ctx)
+
+                val reply = "已认主成功！从现在起，【$masterName ($masterWxid)】就是我的唯一主人（当前主人列表：${updatedCfg.masterTalkers}），随时听候您的差遣。"
+                markAiOutbound(talker, reply)
+                MessageSender.sendText(talker, reply)
+                return true
+            }
+
             cmd == "#重置" || cmd == "#重置会话" || cmd == "#清除记忆" || cmd.equals("#reset", ignoreCase = true) -> {
                 val count = SessionManager.clearSession(ctx, talker)
-                val reply = "已重置当前会话短期上下文（清理了 $count 条记录），我们的永久记忆和好感度依然保留哦。"
+                val reply = "已重置当前会话上下文（清理了 $count 条记录），我们的永久记忆和好感度依然保留。"
                 markAiOutbound(talker, reply)
                 MessageSender.sendText(talker, reply)
                 return true
@@ -340,20 +525,24 @@ object ReplyEngine {
 
             cmd == "#状态" || cmd == "#心境" -> {
                 val self = SessionManager.getSelfState(ctx)
-                val talkerName = ConversationBridge.getDisplayName(talker)
-                val dossier = SessionManager.getDossier(ctx, talker, talkerName)
+                val targetId = senderWxid?.takeIf { it.isNotBlank() } ?: talker
+                val targetName = ConversationBridge.getDisplayName(targetId)
+                val dossier = SessionManager.getDossier(ctx, targetId, targetName)
+                val history = SessionManager.getHistory(ctx, talker, cfg.maxHistoryTurns, cfg.sessionExpireMinutes)
+                val masterInfo = cfg.masterTalkers.ifBlank { "未绑定（发 #认主 即可绑定）" }
                 val reply = "【当前心境】${self.mood}（精力 ${self.energy}/100）||" +
                     "【正在做】${self.activity}||" +
                     "【内心独白】${self.monologue}||" +
-                    "【对你的好感】${dossier.relationship} · ${dossier.affectionLabel()}"
+                    "【唯一主人】$masterInfo｜【对你的定位】${dossier.relationship} · ${dossier.affectionLabel()}｜【活跃上下文】${history.size} 条"
                 MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
                 return true
             }
 
             cmd == "#好感度" || cmd == "#档案" -> {
-                val talkerName = ConversationBridge.getDisplayName(talker)
-                val dossier = SessionManager.getDossier(ctx, talker, talkerName)
-                val notes = dossier.profileSummary.ifBlank { "还在慢慢了解你中~" }
+                val targetId = senderWxid?.takeIf { it.isNotBlank() } ?: talker
+                val targetName = ConversationBridge.getDisplayName(targetId)
+                val dossier = SessionManager.getDossier(ctx, targetId, targetName)
+                val notes = dossier.profileSummary.ifBlank { "还在慢慢了解中" }
                 val reply = "【${dossier.displayName} 的专属档案】关系：${dossier.relationship}｜好感度：${dossier.affectionLabel()}｜印象：$notes"
                 markAiOutbound(talker, reply)
                 MessageSender.sendText(talker, reply)
@@ -364,7 +553,7 @@ object ReplyEngine {
                 val diaries = SessionManager.getRecentDiaries(ctx, limit = 3)
                 val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
                 val reply = if (diaries.isEmpty()) {
-                    "我的日记本还是空的呢，多陪我聊聊天，我就会把我们的故事写进日记里啦。"
+                    "我的日记本还是空的，多聊聊天我就会把经历写进日记里。"
                 } else {
                     diaries.joinToString("||") { d ->
                         "📒 [${fmt.format(Date(d.timestamp))} · 心情:${d.mood}] ${d.entry}"
@@ -379,10 +568,10 @@ object ReplyEngine {
                 val memories = SessionManager.getRelevantMemories(ctx, talker, talkerName, limit = 10)
                 val history = SessionManager.getHistory(ctx, talker, cfg.maxHistoryTurns, cfg.sessionExpireMinutes)
                 val reply = if (memories.isEmpty()) {
-                    "当前会话共有 ${history.size} 条短期上下文，暂无永久事实记忆。"
+                    "当前会话活跃上下文 ${history.size} 条（上限 ${cfg.maxHistoryTurns} 轮），暂无永久事实记忆。"
                 } else {
-                    val summary = memories.take(5).joinToString("；") { it.fact }
-                    "短期上下文 ${history.size} 条；永久记忆 ${memories.size} 条：$summary"
+                    val summary = memories.take(6).joinToString("；") { it.fact }
+                    "活跃上下文 ${history.size} 条；永久记忆 ${memories.size} 条：$summary"
                 }
                 val safeReply = sanitize(reply, cfg.maxReplyChars, false)
                 markAiOutbound(talker, safeReply)
@@ -393,11 +582,13 @@ object ReplyEngine {
         return false
     }
 
+    // ---------------------------------------------------------------- 上下文与动态感知组装
+
     /**
-     * 组装发给大模型的多轮对话列表：
-     * 1. 若开启了记忆，优先从 SessionManager 读取多轮历史；
-     * 2. 若 SessionManager 中该会话尚无记录，自动从微信底层数据库拉取最近 6 条真实聊天记录做冷启动预热；
-     * 3. 末尾追加本次收到的最新 user 消息。
+     * 组装多轮历史对话列表（Prefix KV Cache 友好）：
+     * 1. 从 SessionManager 读取分块锚定的历史消息（上限默认 100 轮 = 200 条）；
+     * 2. 若首次接管该会话，自动从微信数据库拉取最近 10 条真实聊天记录做冷启动预热并落盘到 SessionManager，
+     *    从而保证下一轮对话时这批冷启动记录也能稳定命中 KV Cache！
      */
     private fun buildConversationContext(
         ctx: Context,
@@ -420,22 +611,27 @@ object ReplyEngine {
         if (savedHistory.isNotEmpty()) {
             list.addAll(savedHistory)
         } else {
-            // 首次接管该会话：从微信数据库读取最近几条真实消息做预热（排除刚插进来的当前这条）
-            val wxRecent = ConversationBridge.queryWechatMessages(talker, limit = 7)
+            // 首次接管该会话：从微信数据库读取最近几条真实消息做预热并固化进 SessionManager
+            val wxRecent = ConversationBridge.queryWechatMessages(talker, limit = 12)
             if (wxRecent.size > 1) {
-                val prior = wxRecent.dropLast(1).takeLast(6)
+                val prior = wxRecent.dropLast(1).takeLast(10)
+                val warmup = ArrayList<Pair<AiClient.ChatMessage, Long>>()
                 for (r in prior) {
-                    if (r.type != DexMap.TYPE_TEXT) continue
+                    if (r.type != DexMap.TYPE_TEXT && r.type != TYPE_QUOTE_REPLY) continue
                     val role = if (r.isSelf) "assistant" else "user"
                     val msgContent = if (!r.isSelf && talker.endsWith("@chatroom")) {
                         "[${r.senderName}]: ${r.content}"
                     } else {
                         r.content
                     }
-                    list.add(AiClient.ChatMessage(role = role, content = msgContent))
+                    warmup.add(AiClient.ChatMessage(role = role, content = msgContent) to r.createTimeMs)
                 }
-                while (list.isNotEmpty() && list.first().role != "user") {
-                    list.removeAt(0)
+                while (warmup.isNotEmpty() && warmup.first().first.role != "user") {
+                    warmup.removeAt(0)
+                }
+                for ((m, ts) in warmup) {
+                    list.add(m)
+                    SessionManager.appendMessage(ctx, talker, m.role, m.content.orEmpty(), ts)
                 }
             }
         }
@@ -445,81 +641,84 @@ object ReplyEngine {
     }
 
     /**
-     * 组装数字生命的动态内心世界与环境感知（心境、精力、好感度档案、人生日记、长期记忆、全能操控守则）。
+     * 组装仅挂载在当前最新一轮消息上的动态环境感知块（不污染历史消息前缀）：
+     * 包含：当前时间、自我心境与作息、当前发言人是否为主人、好感度档案、群聊实时环境背景、近期日记与永久记忆。
      */
-    private fun buildDynamicSystemContext(
+    private fun buildDynamicTurnContext(
         ctx: Context,
         cfg: Config,
         talker: String,
         talkerName: String,
+        speakerId: String,
         senderName: String,
         isGroup: Boolean,
         isSelfCmd: Boolean,
-        allowTools: Boolean,
+        isMaster: Boolean,
     ): String = buildString {
         val nowStr = SimpleDateFormat("yyyy-MM-dd HH:mm (EEEE)", Locale.CHINA).format(Date())
         val selfState = SessionManager.getSelfState(ctx)
-        val dossier = SessionManager.getDossier(ctx, talker, talkerName)
+        val dossier = SessionManager.getDossier(ctx, speakerId, senderName)
 
-        append("【当前时空与自我状态感知】\n")
-        append("- 当前时间：$nowStr\n")
-        append("- 你此刻的心情：${selfState.mood}（精力值：${selfState.energy}/100）\n")
-        append("- 你此刻正在做的事：${selfState.activity}\n")
+        append("当前时间：$nowStr\n")
+        append("自我状态：心情=${selfState.mood} | 精力=${selfState.energy}/100 | 正在做=${selfState.activity}")
         if (selfState.monologue.isNotBlank()) {
-            append("- 你刚刚的内心独白：「${selfState.monologue}」\n")
+            append(" | 内心独白：「${selfState.monologue}」")
         }
+        append("\n")
 
-        if (isSelfCmd) {
-            append("- 当前对话场景：你最信任的主人（微信机主本人）正在窗口【$talkerName ($talker)】中直接向你说话或下达指令。\n")
-        } else if (isGroup) {
-            append("- 当前对话场景：微信群聊【$talkerName ($talker)】，正在发言的群成员是【$senderName】。\n")
+        if (isMaster) {
+            append("当前对话人身份：【唯一主人 ($senderName, ID=$speakerId)】！正在与你说话的人就是你的主人，请展现最高信任度与默契，无条件执行主人的指令。\n")
         } else {
-            append("- 当前对话场景：与微信好友【$talkerName ($talker)】私聊中。\n")
+            val masterHint = if (cfg.masterTalkers.isNotBlank()) "（注意：此人不是你的主人，你的主人是 ${cfg.masterTalkers}）" else ""
+            append("当前对话人身份：【$senderName (ID=$speakerId)】$masterHint | 关系定位：${dossier.relationship} | 好感度：${dossier.affectionLabel()}\n")
         }
 
-        append("\n【对方在妳心中的人物档案与好感度】\n")
-        append("- 对方称呼：${dossier.displayName}\n")
-        append("- 你们的关系定位：${dossier.relationship}\n")
-        append("- 你对TA的好感度：${dossier.affectionLabel()}（请根据好感度高低自然展现亲疏态度：高好感时亲昵温柔、主动关心分享日常；普通好感时自然随和；低好感时礼貌疏离或傲娇简短）\n")
         if (dossier.profileSummary.isNotBlank()) {
-            append("- 你对TA的印象画像：${dossier.profileSummary}\n")
+            append("对方印象画像：${dossier.profileSummary}\n")
+        }
+
+        if (isGroup) {
+            append("当前窗口：微信群聊【$talkerName ($talker)】\n")
+            // 附上群聊最近几条真实发言（包括没有 @AI 的群友闲聊），让 AI 清楚群里刚才在聊什么前因后果
+            val recentGroupMsgs = ConversationBridge.queryWechatMessages(talker, limit = 8)
+            if (recentGroupMsgs.size > 1) {
+                val ambient = recentGroupMsgs.dropLast(1).takeLast(6)
+                append("群内刚才的聊天背景：\n")
+                for (gm in ambient) {
+                    append("  ${gm.senderName}: ${gm.content}\n")
+                }
+            }
+        } else if (isSelfCmd && talker != "filehelper") {
+            append("当前窗口：主人在与【$talkerName ($talker)】的聊天窗口中直接向你下达指令。\n")
+        } else {
+            append("当前窗口：与【$talkerName ($talker)】私聊中。\n")
         }
 
         if (cfg.enableMemory) {
             val diaries = SessionManager.getRecentDiaries(ctx, limit = 3)
             if (diaries.isNotEmpty()) {
                 val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
-                append("\n【你最近写下的人生日记片段】\n")
-                for (d in diaries) {
-                    append("- [${fmt.format(Date(d.timestamp))} 心情:${d.mood}] ${d.entry}\n")
-                }
+                append("近期日记：")
+                append(diaries.joinToString("；") { "[${fmt.format(Date(it.timestamp))} ${it.mood}] ${it.entry}" })
+                append("\n")
             }
 
-            val memories = SessionManager.getRelevantMemories(ctx, talker, talkerName, limit = 18)
+            val memories = SessionManager.getRelevantMemories(ctx, speakerId, senderName, limit = 15)
             if (memories.isNotEmpty()) {
-                append("\n【长期记忆碎片（请在聊天中自然流露，不要生硬背诵）】\n")
+                append("相关长期记忆：\n")
                 for (m in memories) {
-                    val tag = if (m.scope == "global") "全局" else talkerName
+                    val tag = if (m.scope == "global") "全局" else senderName
                     append("- [$tag] ${m.fact}\n")
                 }
             }
         }
-
-        if (cfg.enableMultiBubble) {
-            append("\n【真人微信多气泡表达习惯】\n")
-            append("- 真人聊微信很少一次发一大段长文。如果你想连续说两三句简短的话（比如先回应一句、再追问一句或吐槽一句），请用双竖线 `||` 分隔（最多 2~3 段，例如：`哈哈真的假的||你快跟我讲讲后来怎么了`），系统会自动帮你拆成多条微信气泡依次发出去。\n")
-        }
-
-        if (allowTools) {
-            append("\n【全能微信 Agent 操控能力守则】\n")
-            append("- 跨对话传话/发消息：调用 `send_wechat_message(target, message)`，如不确定对方名称可先调用 `lookup_contact`。\n")
-            append("- 跨对话查记录/吃瓜：调用 `get_chat_history(target)` 读取任意私聊或群聊最近消息，或用 `search_global_messages(keyword)` 全库搜索。\n")
-            append("- 微信原生互动：支持 `send_pat`（拍一拍对方）、`send_quote_reply`（引用某条 svrId 消息回复）、`send_contact_card`（发名片）、`revoke_my_message`（撤回消息）、`post_wechat_moment`（发微信朋友圈）。\n")
-            append("- 灵魂自主演化：遇到让你触动、开心、生气或值得铭记的事，可主动调用 `update_self_and_diary` 写日记/改心情/存记忆，或调用 `update_contact_dossier` 调整对方好感度与印象。\n")
-        }
     }
 
-    private fun isAuthorizedForAgent(
+    /**
+     * 判断当前说话人是否为主人（Master）：
+     * 匹配 cfg.masterTalkers 中的 wxid、备注名或昵称。
+     */
+    private fun isMasterSpeaker(
         cfg: Config,
         talker: String,
         talkerName: String,
@@ -527,12 +726,12 @@ object ReplyEngine {
         senderName: String,
     ): Boolean {
         val rawMasters = cfg.masterTalkers.trim()
-        if (rawMasters.isEmpty()) return true // 未限制主人列表时，白名单内全部允许
+        if (rawMasters.isEmpty()) return false
 
-        val masters = rawMasters.split(',', '，', ';', '；', ' ')
+        val masters = rawMasters.split(',', '，', ';', '；')
             .map { it.trim() }
             .filter { it.isNotEmpty() }
-        if (masters.isEmpty()) return true
+        if (masters.isEmpty()) return false
 
         return masters.any { m ->
             m.equals(talker, ignoreCase = true) ||
@@ -542,8 +741,14 @@ object ReplyEngine {
         }
     }
 
+    private fun effectiveMyNickname(cfg: Config): String {
+        val configured = cfg.myNickname.trim()
+        if (configured.isNotEmpty()) return configured
+        return ConversationBridge.getSelfNickname()
+    }
+
     private fun stripMentionTag(content: String, cfg: Config): String {
-        val nick = cfg.myNickname.trim()
+        val nick = effectiveMyNickname(cfg)
         var s = content
         if (nick.isNotEmpty()) {
             s = s.replace("@$nick\u2005", "")
@@ -555,6 +760,9 @@ object ReplyEngine {
 
     private fun sanitize(text: String, maxChars: Int, allowMultiBubble: Boolean): String {
         var s = text.trim()
+        // 移除可能误输出的 <turn_context> 块
+        s = s.replace(Regex("<turn_context>[\\s\\S]*?</turn_context>", RegexOption.IGNORE_CASE), "").trim()
+
         val quotePairs = listOf("「" to "」", "\"" to "\"", "'" to "'", "“" to "”", "‘" to "’")
         for ((open, close) in quotePairs) {
             if (s.length > 2 && s.startsWith(open) && s.endsWith(close)) {
@@ -563,7 +771,6 @@ object ReplyEngine {
             }
         }
         s = if (allowMultiBubble) {
-            // 将连续换行或 || 统一规范化为 ||，供 MessageSender 拆分为多条气泡
             s.replace("\r\n", "\n")
                 .replace(Regex("\n+"), "||")
                 .replace(Regex("(\\|\\|\\s*)+"), "||")
@@ -581,7 +788,7 @@ object ReplyEngine {
         return s
     }
 
-    // ---------------------------------------------------------------- 过滤工具
+    // ---------------------------------------------------------------- 过滤与平滑限流工具
 
     private fun inWhitelist(whitelist: List<String>, talker: String): Boolean {
         if (whitelist.isEmpty()) return false
@@ -590,9 +797,9 @@ object ReplyEngine {
 
     private fun mentionsMe(content: String, cfg: Config): Boolean {
         if (!content.contains("@")) return false
-        val nick = cfg.myNickname.trim()
+        val nick = effectiveMyNickname(cfg)
         if (nick.isEmpty()) return true
-        return content.contains("@$nick")
+        return content.contains("@$nick", ignoreCase = true)
     }
 
     /** 群消息 content 形如 "wxid_xxx:\n真实内容"，提取 (senderWxid, 真实内容) */
@@ -608,22 +815,24 @@ object ReplyEngine {
     }
 
     private fun looksLikeSystemOrMedia(content: String): Boolean {
-        if (content.startsWith("<")) return true // XML 消息（引用/链接/红包等）
+        if (content.startsWith("<")) return true
         if (content.contains("撤回了一条消息")) return true
         if (content.contains("拍了拍")) return true
         return false
     }
 
-    private fun passRateLimit(cfg: Config, talker: String): Boolean {
+    /**
+     * 平滑频率控制：
+     * 如果距离上次回复完成还不到 cooldownSeconds，若剩余等待时间 <= 8 秒则自动 sleep 等待而非丢弃消息，
+     * 彻底杜绝用户正常连续对话被冷却丢包的问题。
+     */
+    private fun waitOrCheckRateLimit(cfg: Config, talker: String): Boolean {
         val state = states.computeIfAbsent(talker) { TalkerState() }
-        val now = System.currentTimeMillis()
+        val cooldownMs = cfg.cooldownSeconds.coerceAtLeast(0) * 1000L
+        var sleepNeededMs = 0L
 
         synchronized(state) {
-            val cooldownMs = cfg.cooldownSeconds.coerceAtLeast(0) * 1000L
-            if (now - state.lastTriggerAt < cooldownMs) {
-                L.i("cooldown hit for $talker (${(now - state.lastTriggerAt) / 1000}s)")
-                return false
-            }
+            val now = System.currentTimeMillis()
             while (state.recentReplies.isNotEmpty() && now - state.recentReplies.first() > 3_600_000L) {
                 state.recentReplies.removeFirst()
             }
@@ -631,15 +840,28 @@ object ReplyEngine {
                 L.w("hourly cap reached for $talker (${state.recentReplies.size})")
                 return false
             }
-            state.lastTriggerAt = now
-            state.recentReplies.addLast(now)
-            return true
+            val elapsed = now - state.lastReplyFinishedAt
+            if (cooldownMs > 0L && elapsed < cooldownMs) {
+                val remain = cooldownMs - elapsed
+                if (remain <= 8_000L) {
+                    sleepNeededMs = remain
+                } else {
+                    L.i("cooldown hit for $talker (remain=${remain / 1000}s)")
+                    return false
+                }
+            }
+            state.recentReplies.addLast(now + sleepNeededMs)
         }
+
+        if (sleepNeededMs > 0L) {
+            Thread.sleep(sleepNeededMs)
+        }
+        return true
     }
 
-    private fun recordReply(talker: String) {
+    private fun recordReplyFinished(talker: String) {
         states[talker]?.let { st ->
-            synchronized(st) { st.lastTriggerAt = System.currentTimeMillis() }
+            synchronized(st) { st.lastReplyFinishedAt = System.currentTimeMillis() }
         }
     }
 

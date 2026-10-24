@@ -36,6 +36,13 @@ object SessionManager {
     /** 记录每个会话距离上次后台反思/写日记新增的对话轮数 */
     private val turnsSinceReflection = ConcurrentHashMap<String, Int>()
 
+    /**
+     * 分块滚动窗口起点锚定（talker -> 起始 message id）：
+     * 避免传统逐条滑窗每轮丢弃第1条消息导致整个 messages 数组前移、从而引发 DeepSeek Prefix KV 缓存 100% 失效。
+     * 只有当当前锚点之后的消息数超过 (targetCount + stepSize) 时，才一次性向前推进一个 stepSize 块。
+     */
+    private val windowAnchorId = ConcurrentHashMap<String, Long>()
+
     // ---------------------------------------------------------------- 数据模型
 
     data class SelfState(
@@ -528,7 +535,13 @@ object SessionManager {
         return list
     }
 
-    // ---------------------------------------------------------------- 短期多轮会话管理
+    // ---------------------------------------------------------------- 多轮会话管理（Prefix KV Cache 锚定优化）
+
+    private data class StoredRow(
+        val id: Long,
+        val msg: AiClient.ChatMessage,
+        val ts: Long,
+    )
 
     fun getHistory(
         ctx: Context,
@@ -537,26 +550,29 @@ object SessionManager {
         expireMinutes: Int,
     ): List<AiClient.ChatMessage> {
         if (maxTurns <= 0) return emptyList()
-        val limit = (maxTurns * 2).coerceIn(2, 100)
-        val rawList = ArrayList<Pair<AiClient.ChatMessage, Long>>(limit)
+        val targetCount = (maxTurns * 2).coerceIn(4, 1000)
+        val stepSize = (targetCount / 5).coerceIn(10, 80)
+        val queryLimit = targetCount + stepSize
+        val rowsReversed = ArrayList<StoredRow>(queryLimit)
 
         try {
             val database = db(ctx)
             database.rawQuery(
                 """
-                SELECT role, content, timestamp
+                SELECT id, role, content, timestamp
                 FROM $TABLE_MESSAGES
                 WHERE talker = ?
                 ORDER BY id DESC
                 LIMIT ?
                 """.trimIndent(),
-                arrayOf(talker, limit.toString())
+                arrayOf(talker, queryLimit.toString())
             ).use { cur ->
                 while (cur.moveToNext()) {
-                    val role = cur.getString(0) ?: continue
-                    val content = cur.getString(1) ?: continue
-                    val ts = cur.getLong(2)
-                    rawList.add(AiClient.ChatMessage(role = role, content = content) to ts)
+                    val id = cur.getLong(0)
+                    val role = cur.getString(1) ?: continue
+                    val content = cur.getString(2) ?: continue
+                    val ts = cur.getLong(3)
+                    rowsReversed.add(StoredRow(id, AiClient.ChatMessage(role = role, content = content), ts))
                 }
             }
         } catch (t: Throwable) {
@@ -564,25 +580,54 @@ object SessionManager {
             return emptyList()
         }
 
-        if (rawList.isEmpty()) return emptyList()
+        if (rowsReversed.isEmpty()) return emptyList()
 
         val expireMs = if (expireMinutes > 0) expireMinutes * 60_000L else 0L
-        val validReversed = ArrayList<AiClient.ChatMessage>(rawList.size)
+        val validReversed = ArrayList<StoredRow>(rowsReversed.size)
         var prevTs = System.currentTimeMillis()
 
-        for ((msg, ts) in rawList) {
-            if (expireMs > 0L && (prevTs - ts) > expireMs) {
+        for (row in rowsReversed) {
+            if (expireMs > 0L && (prevTs - row.ts) > expireMs) {
                 break
             }
-            validReversed.add(msg)
-            prevTs = ts
+            validReversed.add(row)
+            prevTs = row.ts
         }
 
         val chronological = validReversed.asReversed().toMutableList()
-        while (chronological.isNotEmpty() && chronological.first().role != "user") {
+        while (chronological.isNotEmpty() && chronological.first().msg.role != "user") {
             chronological.removeAt(0)
         }
-        return chronological
+        if (chronological.isEmpty()) return emptyList()
+
+        // 分块锚定逻辑：保证在 [targetCount .. targetCount + stepSize] 区间内，首条消息 ID 恒定不变，实现 100% 追加式前缀缓存命中
+        val currentAnchor = windowAnchorId[talker]
+        val anchorIdx = if (currentAnchor != null) {
+            chronological.indexOfFirst { it.id >= currentAnchor }
+        } else {
+            -1
+        }
+
+        val effectiveStartIdx = if (anchorIdx >= 0 && (chronological.size - anchorIdx) <= queryLimit) {
+            anchorIdx
+        } else {
+            // 首次初始化锚点，或当前窗口已超出高水位线 (targetCount + stepSize)：向前裁切一个块并固定新锚点
+            var newStart = (chronological.size - targetCount).coerceAtLeast(0)
+            while (newStart < chronological.size && chronological[newStart].msg.role != "user") {
+                newStart++
+            }
+            if (newStart < chronological.size) {
+                windowAnchorId[talker] = chronological[newStart].id
+            }
+            newStart
+        }
+
+        val anchoredSlice = if (effectiveStartIdx in 0 until chronological.size) {
+            chronological.subList(effectiveStartIdx, chronological.size)
+        } else {
+            chronological
+        }
+        return anchoredSlice.map { it.msg }
     }
 
     fun appendMessage(
@@ -610,7 +655,7 @@ object SessionManager {
                     SELECT id FROM $TABLE_MESSAGES
                     WHERE talker = ?
                     ORDER BY id DESC
-                    LIMIT 120
+                    LIMIT 2000
                 )
                 """.trimIndent(),
                 arrayOf(talker, talker)
@@ -630,6 +675,7 @@ object SessionManager {
 
     fun clearSession(ctx: Context, talker: String): Int {
         turnsSinceReflection.remove(talker)
+        windowAnchorId.remove(talker)
         return try {
             db(ctx).delete(TABLE_MESSAGES, "talker = ?", arrayOf(talker))
         } catch (t: Throwable) {

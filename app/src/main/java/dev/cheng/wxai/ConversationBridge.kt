@@ -38,6 +38,48 @@ object ConversationBridge {
     /** 微信 wxid -> 展示名（备注优先，其次昵称）缓存 */
     private val displayNameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
+    @Volatile
+    private var cachedSelfWxid: String? = null
+
+    @Volatile
+    private var cachedSelfNickname: String? = null
+
+    fun getSelfWxid(): String {
+        cachedSelfWxid?.let { if (it.isNotEmpty()) return it }
+        val db = ensureDb() ?: return ""
+        try {
+            rawQuery(db, "SELECT value FROM userinfo WHERE id = 2 LIMIT 1")?.use { cur ->
+                if (cur.moveToFirst() && !cur.isNull(0)) {
+                    val v = cur.getString(0).orEmpty().trim()
+                    if (v.isNotEmpty()) {
+                        cachedSelfWxid = v
+                        return v
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return ""
+    }
+
+    fun getSelfNickname(): String {
+        cachedSelfNickname?.let { if (it.isNotEmpty()) return it }
+        val db = ensureDb() ?: return ""
+        try {
+            rawQuery(db, "SELECT value FROM userinfo WHERE id = 4 LIMIT 1")?.use { cur ->
+                if (cur.moveToFirst() && !cur.isNull(0)) {
+                    val v = cur.getString(0).orEmpty().trim()
+                    if (v.isNotEmpty()) {
+                        cachedSelfNickname = v
+                        return v
+                    }
+                }
+            }
+        } catch (_: Throwable) {
+        }
+        return ""
+    }
+
     data class WechatMessageRecord(
         val msgId: Long = 0L,
         val msgSvrId: Long = 0L,
@@ -457,12 +499,13 @@ object ConversationBridge {
 
                     val readableBody = when (type) {
                         DexMap.TYPE_TEXT -> body.trim()
+                        822083633 -> parseQuotedMessageText(body) ?: "[引用消息]"
                         3 -> "[图片]"
                         34 -> "[语音]"
                         43 -> "[视频]"
                         47 -> "[表情包]"
                         10000 -> "[系统提示: ${body.take(40)}]"
-                        else -> if (body.startsWith("<")) "[富媒体/卡片消息]" else body.take(120)
+                        else -> parseQuotedMessageText(body) ?: if (body.startsWith("<")) "[富媒体/卡片消息]" else body.take(120)
                     }
 
                     if (readableBody.isNotEmpty()) {
@@ -485,6 +528,38 @@ object ConversationBridge {
             L.e("$TAG queryWechatMessages($cleanTalker) failed", t)
         }
         return rawReversed.asReversed()
+    }
+
+    /**
+     * 解析微信「引用回复」XML 消息（type = 822083633 / appmsg type 57），提取用户新说的话与被引用原文。
+     */
+    fun parseQuotedMessageText(rawXml: String): String? {
+        val s = rawXml.trim()
+        if (!s.contains("<refermsg>") && !s.contains("<title>")) return null
+        val title = extractXmlTag(s, "title").trim()
+        if (title.isEmpty()) return null
+        val referBlock = extractXmlTag(s, "refermsg")
+        if (referBlock.isEmpty()) return title
+        val refAuthor = extractXmlTag(referBlock, "displayname").trim().ifEmpty { "对方" }
+        val refSvrId = extractXmlTag(referBlock, "svrid").trim()
+        val refContentRaw = extractXmlTag(referBlock, "content").trim()
+        val refContent = if (refContentRaw.startsWith("<")) "[富媒体消息]" else refContentRaw.take(80)
+        val svrInfo = if (refSvrId.isNotEmpty()) "(svrId=$refSvrId)" else ""
+        return "「引用 $refAuthor$svrInfo: $refContent」$title"
+    }
+
+    private fun extractXmlTag(xml: String, tag: String): String {
+        val open = "<$tag>"
+        val close = "</$tag>"
+        val i = xml.indexOf(open)
+        if (i < 0) return ""
+        val j = xml.indexOf(close, i + open.length)
+        if (j < 0) return ""
+        return xml.substring(i + open.length, j)
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
     }
 
     /**
