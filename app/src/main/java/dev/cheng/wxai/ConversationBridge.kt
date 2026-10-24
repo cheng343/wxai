@@ -148,8 +148,10 @@ object ConversationBridge {
         }
 
         var cls: Class<*>? = storageObj.javaClass
-        while (cls != null && cls != Any::class.java) {
-            for (f in cls.declaredFields) {
+        while (true) {
+            val c = cls ?: break
+            if (c == Any::class.java) break
+            for (f in c.declaredFields) {
                 if (Modifier.isStatic(f.modifiers)) continue
                 val value = try {
                     f.isAccessible = true
@@ -161,20 +163,21 @@ object ConversationBridge {
                 val runtimeName = value.javaClass.name
                 val declaredName = f.type.name
                 if (runtimeName.contains("SQLiteDatabase")) {
-                    L.i("$TAG direct SQLiteDatabase field ${cls.name}#${f.name}")
+                    L.i("$TAG direct SQLiteDatabase field ${c.name}#${f.name}")
                     return value
                 }
                 if (runtimeName == DexMap.SQLITE_WRAPPER ||
                     declaredName == DexMap.SQLITE_WRAPPER ||
                     declaredName == SQLITE_INTERFACE
                 ) {
-                    callDatabaseAccessor(value)?.let {
-                        L.i("$TAG db handle via ${cls.name}#${f.name} (declared=$declaredName, runtime=$runtimeName)")
-                        return it
+                    val db = callDatabaseAccessor(value)
+                    if (db != null) {
+                        L.i("$TAG db handle via ${c.name}#${f.name} (declared=$declaredName, runtime=$runtimeName)")
+                        return db
                     }
                 }
             }
-            cls = cls.superclass
+            cls = c.superclass
         }
         return null
     }
@@ -190,8 +193,10 @@ object ConversationBridge {
         }
 
         var cls: Class<*>? = wrapper.javaClass
-        while (cls != null && cls != Any::class.java) {
-            for (m in cls.declaredMethods) {
+        while (true) {
+            val c = cls ?: break
+            if (c == Any::class.java) break
+            for (m in c.declaredMethods) {
                 if (Modifier.isStatic(m.modifiers)) continue
                 if (m.parameterCount != 0) continue
                 if (!m.returnType.name.contains("SQLiteDatabase")) continue
@@ -199,13 +204,13 @@ object ConversationBridge {
                     m.isAccessible = true
                     val r = m.invoke(wrapper)
                     if (r != null) {
-                        L.i("$TAG accessor ${cls.name}#${m.name}(): ${m.returnType.name}")
+                        L.i("$TAG accessor ${c.name}#${m.name}(): ${m.returnType.name}")
                         return r
                     }
                 } catch (_: Throwable) {
                 }
             }
-            cls = cls.superclass
+            cls = c.superclass
         }
         return null
     }
