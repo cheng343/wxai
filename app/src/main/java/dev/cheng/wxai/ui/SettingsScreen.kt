@@ -936,6 +936,11 @@ private fun ModelAndServiceTab(
         edit = edit,
         onTest = onTest,
     )
+    VisionServiceCard(
+        cfg = cfg,
+        update = update,
+        edit = edit,
+    )
     DebugCard(
         debug = cfg.debug,
         onDebugChange = { value -> update { it.copy(debug = value) } },
@@ -1056,6 +1061,69 @@ private fun AiServiceCard(
                 }
             },
         )
+    }
+}
+
+@Composable
+private fun VisionServiceCard(
+    cfg: Config,
+    update: (((Config) -> Config)) -> Unit,
+    edit: (EditorSpec) -> Unit,
+) {
+    SettingsCard(title = "多模态视觉与表情包识图（DeepSeek 接入 QQ 同款体验）") {
+        SwitchRow(
+            title = "启用图片与表情包识图理解",
+            subtitle = "截获微信表情包 (type=47) 与图片 (type=3) 转为高精画面描述并送入 AI，实现懂图懂梗",
+            checked = cfg.enableVision,
+            onCheckedChange = { value -> update { it.copy(enableVision = value) } },
+        )
+        if (cfg.enableVision) {
+            ValueRow(
+                title = "视觉模型（留空默认采用 Qwen2.5-VL / 主模型）",
+                value = cfg.visionModel.ifBlank { "默认智能匹配 (Qwen2.5-VL / 主模型)" },
+                onClick = {
+                    edit(
+                        EditorSpec.Text(
+                            title = "视觉模型名称",
+                            initial = cfg.visionModel,
+                            placeholder = "Qwen/Qwen2.5-VL-72B-Instruct",
+                            onApply = { value -> update { it.copy(visionModel = value.trim()) } },
+                        )
+                    )
+                },
+            )
+            ValueRow(
+                title = "视觉接口 Base URL（留空沿用主模型）",
+                value = cfg.visionBaseUrl.ifBlank { "沿用主模型接口" },
+                onClick = {
+                    edit(
+                        EditorSpec.Text(
+                            title = "视觉接口 Base URL",
+                            initial = cfg.visionBaseUrl,
+                            keyboardType = KeyboardType.Uri,
+                            placeholder = "https://api.siliconflow.cn/v1",
+                            onApply = { value -> update { it.copy(visionBaseUrl = value.trim()) } },
+                        )
+                    )
+                },
+            )
+            ValueRow(
+                title = "视觉接口 API Key（留空沿用主模型）",
+                value = if (cfg.visionApiKey.isBlank()) "沿用主模型 API Key" else "已单独设置（点此修改）",
+                onClick = {
+                    edit(
+                        EditorSpec.Text(
+                            title = "视觉接口 API Key",
+                            initial = cfg.visionApiKey,
+                            password = true,
+                            keyboardType = KeyboardType.Password,
+                            placeholder = "sk-…",
+                            onApply = { value -> update { it.copy(visionApiKey = value.trim()) } },
+                        )
+                    )
+                },
+            )
+        }
     }
 }
 

@@ -39,14 +39,20 @@ data class Config(
     val maxHistoryTurns: Int = 100,
     /** 会话超时时间（分钟），0 表示永不断片（跨天保持完整上下文与 KV 缓存） */
     val sessionExpireMinutes: Int = 0,
-    /** 每隔多少轮对话在后台自动进行一次记忆反思、更新好感度并写日记（0 = 关闭自动反思） */
-    val autoReflectionTurns: Int = 8,
+    /** 每隔多少轮对话在后台自动进行一次记忆反思、更新好感度并写日记（0 = 关闭自动反思，默认3轮自动沉淀） */
+    val autoReflectionTurns: Int = 3,
     /** 拟人多气泡分段发送（将 || 分隔或多行短句模拟真人打字间隔分多条发出） */
     val enableMultiBubble: Boolean = true,
     /** 是否启用 Agent 跨对话操控能力（12 大微信操控工具） */
     val enableAgentTools: Boolean = true,
     /** 主人标识（可从会话列表选择、在微信发 #认主 自动绑定、或手动填 wxid/昵称，逗号分隔） */
     val masterTalkers: String = "",
+    /** 是否启用多模态图片与表情包识图理解 */
+    val enableVision: Boolean = true,
+    /** 视觉模型名称（若留空且主模型为文本模型，自动采用业内最强视觉备选 Qwen2.5-VL 或主模型） */
+    val visionModel: String = "",
+    val visionBaseUrl: String = "",
+    val visionApiKey: String = "",
     val debug: Boolean = true,
 ) {
     fun toJson(): JSONObject = JSONObject().apply {
@@ -72,6 +78,10 @@ data class Config(
         put("enableMultiBubble", enableMultiBubble)
         put("enableAgentTools", enableAgentTools)
         put("masterTalkers", masterTalkers)
+        put("enableVision", enableVision)
+        put("visionModel", visionModel)
+        put("visionBaseUrl", visionBaseUrl)
+        put("visionApiKey", visionApiKey)
         put("debug", debug)
     }
 
@@ -137,6 +147,10 @@ data class Config(
                     enableMultiBubble = o.optBoolean("enableMultiBubble", DEFAULT.enableMultiBubble),
                     enableAgentTools = o.optBoolean("enableAgentTools", DEFAULT.enableAgentTools),
                     masterTalkers = o.str("masterTalkers", DEFAULT.masterTalkers),
+                    enableVision = o.optBoolean("enableVision", DEFAULT.enableVision),
+                    visionModel = o.str("visionModel", DEFAULT.visionModel),
+                    visionBaseUrl = o.str("visionBaseUrl", DEFAULT.visionBaseUrl),
+                    visionApiKey = o.str("visionApiKey", DEFAULT.visionApiKey),
                     debug = o.optBoolean("debug", true),
                 )
             } catch (t: Throwable) {

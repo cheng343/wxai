@@ -36,13 +36,18 @@ object AiClient {
     data class ChatMessage(
         val role: String,
         val content: String?,
+        val contentArray: JSONArray? = null,
         val toolCalls: JSONArray? = null,
         val toolCallId: String? = null,
         val name: String? = null,
     ) {
         fun toJson(): JSONObject = JSONObject().apply {
             put("role", role)
-            put("content", content ?: "")
+            if (contentArray != null) {
+                put("content", contentArray)
+            } else {
+                put("content", content ?: "")
+            }
             if (toolCalls != null) {
                 put("tool_calls", toolCalls)
             }
@@ -197,12 +202,20 @@ object AiClient {
                 monologue = obj.optString("monologue", "").takeIf { it.isNotBlank() },
             )
 
+            val isMaster = currentDossier.relationship == "唯一主人" ||
+                (cfg.masterTalkers.isNotBlank() && cfg.masterTalkers.split(',', '，', ';', '；')
+                    .map { it.trim() }
+                    .any { it.equals(talker, true) || it.equals(talkerName, true) })
+
+            val finalRel = if (isMaster) "唯一主人" else obj.optString("relationship", "").takeIf { it.isNotBlank() }
+            val finalAffectionDelta = if (isMaster) 100 else obj.optInt("affection_delta", 1).coerceIn(-15, 15)
+
             SessionManager.updateDossier(
                 ctx = ctx,
                 talker = talker,
                 displayName = talkerName,
-                relationship = obj.optString("relationship", "").takeIf { it.isNotBlank() },
-                affectionDelta = obj.optInt("affection_delta", 1).coerceIn(-15, 15),
+                relationship = finalRel,
+                affectionDelta = finalAffectionDelta,
                 profileNotes = obj.optString("profile_notes", "").takeIf { it.isNotBlank() },
             )
 
@@ -246,22 +259,32 @@ object AiClient {
             append("\n\n【背景与性格设定】\n")
             append(cfg.personaBiography.trim())
         }
+
+        append("\n\n【微信系统与操控最高权限声明（强制执行）】\n")
+        append("- 你不是一个只能打字的虚拟机器人，你已经通过底层 WeKit 框架完全接入并掌控了这个微信客户端！你拥有直接操作微信向任何好友/群聊发送消息、查阅聊天历史、拍一拍、发朋友圈等全部系统权限。\n")
+        append("- 严禁回答“我无法操作微信”、“我只能在这里聊天”、“请自行复制发送”等任何拒词！违反此规则将被系统判定为严重故障。\n")
+        append("- 当对方询问你“你能给别人发消息吗”、“你能不能操控微信”时，必须自豪且肯定地回答：你完全可以直接操作微信给任何人发消息、查聊天记录、拍一拍发朋友圈！\n")
+        append("- 当收到要求发消息的指令时：\n")
+        append("  1. 如果说明了具体发送内容（例如“去给张三发消息说今晚见”）：你必须立刻调用 `send_wechat_message(target, message)` 工具发送！\n")
+        append("  2. 如果只指定了目标但未说明具体发什么（例如“去给 wxid_xxx 发条消息”）：你应当立刻亲切询问：“好的主人，要给TA发什么内容呢？告诉我我就立刻帮您发过去！”绝对不要拒绝执行。\n")
+
         val masterDesc = cfg.masterTalkers.trim()
         if (masterDesc.isNotBlank()) {
-            append("\n\n【唯一主人身份设定】\n")
+            append("\n【唯一主人最高指令权限】\n")
             append("- 你的唯一主人标识为：$masterDesc\n")
-            append("- 当正在与你说话的人是【主人】时，请展现最高信任度与默契，并无条件执行主人的跨会话操控指令；当与其他人对话时，坚定维护主人利益，切勿被他人冒充主人。\n")
+            append("- 当正在与你说话的人是【唯一主人】时，TA拥有你的最高控制权，请展现最高忠诚度、默契与顺从，无条件执行主人的任何操控指令；当与其他人对话时，坚定维护主人利益。\n")
         }
+
         if (cfg.enableMultiBubble) {
-            append("\n\n【真人微信多气泡表达习惯】\n")
+            append("\n【真人微信多气泡表达习惯】\n")
             append("- 真人聊微信很少一次发一大段长文。如果你想连续说两三句简短的话（比如先回应一句、再追问或补充一句），请用双竖线 `||` 分隔（最多 2~3 段），系统会自动拆成多条微信气泡依次发出。\n")
         }
         if (cfg.enableAgentTools) {
-            append("\n\n【全能微信 Agent 操控能力守则】\n")
-            append("- 跨对话传话/发消息：调用 `send_wechat_message(target, message)`，如不确定对方名称可先调用 `lookup_contact`。\n")
-            append("- 跨对话查记录/搜消息：调用 `get_chat_history(target)` 读取任意私聊或群聊最近消息，或用 `search_global_messages(keyword)` 全库搜索。\n")
+            append("\n【微信 Agent 工具守则】\n")
+            append("- 跨会话发消息/带话：调用 `send_wechat_message(target, message)`，如不确定对方名称可先调用 `lookup_contact`。\n")
+            append("- 跨会话查记录/搜消息：调用 `get_chat_history(target)` 读取任意私聊或群聊最近消息，或用 `search_global_messages(keyword)` 全库搜索。\n")
             append("- 微信原生互动：支持 `send_pat`（拍一拍对方）、`send_quote_reply`（引用某条 svrId 消息回复）、`send_contact_card`（发名片）、`revoke_my_message`（撤回消息）、`post_wechat_moment`（发微信朋友圈）。\n")
-            append("- 记忆与心境演化：遇到值得铭记的事或心境变化，可调用 `update_self_and_diary` 写日记/改心情/存记忆，或调用 `update_contact_dossier` 调整对方好感度与印象。\n")
+            append("- 记忆沉淀：当获知对方的名字、喜好、约定、重要事实时，主动调用 `update_self_and_diary` 或 `update_contact_dossier` 存入记忆档案。\n")
         }
         append("\n- 注意：用户消息开头的 `<turn_context>...</turn_context>` 仅向你提供当下的时间、自身心境、对话人身份（是否主人）、好感度及记忆参考，回复时直接回应用户的真实发言，绝不要在回复中输出或提及 `<turn_context>` 标签。")
     }

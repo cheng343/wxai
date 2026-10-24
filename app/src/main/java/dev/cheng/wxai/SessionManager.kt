@@ -22,7 +22,7 @@ import java.util.concurrent.ConcurrentHashMap
 object SessionManager {
 
     private const val DB_NAME = "wxai_memory.db"
-    private const val DB_VERSION = 2
+    private const val DB_VERSION = 3
 
     private const val TABLE_MESSAGES = "session_messages"
     private const val TABLE_MEMORIES = "long_term_memories"
@@ -33,8 +33,23 @@ object SessionManager {
     @Volatile
     private var dbHelper: Helper? = null
 
-    /** 记录每个会话距离上次后台反思/写日记新增的对话轮数 */
-    private val turnsSinceReflection = ConcurrentHashMap<String, Int>()
+    /** 记录每个会话距离上次后台反思/写日记新增的对话轮数（使用持久化存储，进程重启不丢失） */
+    fun getUnreflectedTurns(ctx: Context, talker: String): Int {
+        val sp = ctx.getSharedPreferences("wxai_session_turns", Context.MODE_PRIVATE)
+        return sp.getInt("t_$talker", 0)
+    }
+
+    fun incrementUnreflectedTurns(ctx: Context, talker: String): Int {
+        val sp = ctx.getSharedPreferences("wxai_session_turns", Context.MODE_PRIVATE)
+        val next = sp.getInt("t_$talker", 0) + 1
+        sp.edit().putInt("t_$talker", next).apply()
+        return next
+    }
+
+    fun resetReflectionCounter(ctx: Context, talker: String) {
+        val sp = ctx.getSharedPreferences("wxai_session_turns", Context.MODE_PRIVATE)
+        sp.edit().putInt("t_$talker", 0).apply()
+    }
 
     /**
      * 分块滚动窗口起点锚定（talker -> 起始 message id）：
@@ -227,73 +242,86 @@ object SessionManager {
         DB_VERSION
     ) {
         override fun onCreate(db: SQLiteDatabase) {
-            db.execSQL(
-                """
-                CREATE TABLE IF NOT EXISTS $TABLE_MESSAGES (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    talker TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp INTEGER NOT NULL
-                )
-                """.trimIndent()
-            )
-            db.execSQL("CREATE INDEX IF NOT EXISTS idx_msg_talker_time ON $TABLE_MESSAGES(talker, timestamp)")
-
-            db.execSQL(
-                """
-                CREATE TABLE IF NOT EXISTS $TABLE_MEMORIES (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    scope TEXT NOT NULL,
-                    fact TEXT NOT NULL,
-                    timestamp INTEGER NOT NULL
-                )
-                """.trimIndent()
-            )
-            db.execSQL("CREATE INDEX IF NOT EXISTS idx_mem_scope ON $TABLE_MEMORIES(scope, timestamp)")
-
-            db.execSQL(
-                """
-                CREATE TABLE IF NOT EXISTS $TABLE_SELF_STATE (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    mood TEXT NOT NULL,
-                    energy INTEGER NOT NULL,
-                    activity TEXT NOT NULL,
-                    monologue TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL
-                )
-                """.trimIndent()
-            )
-
-            db.execSQL(
-                """
-                CREATE TABLE IF NOT EXISTS $TABLE_DOSSIERS (
-                    talker TEXT PRIMARY KEY,
-                    display_name TEXT NOT NULL,
-                    relationship TEXT NOT NULL,
-                    affection INTEGER NOT NULL,
-                    profile_summary TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL
-                )
-                """.trimIndent()
-            )
-
-            db.execSQL(
-                """
-                CREATE TABLE IF NOT EXISTS $TABLE_DIARY (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    mood TEXT NOT NULL,
-                    related_person TEXT NOT NULL,
-                    entry TEXT NOT NULL,
-                    timestamp INTEGER NOT NULL
-                )
-                """.trimIndent()
-            )
-            db.execSQL("CREATE INDEX IF NOT EXISTS idx_diary_time ON $TABLE_DIARY(timestamp DESC)")
+            createAllTables(db)
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-            onCreate(db)
+            createAllTables(db)
+        }
+
+        override fun onOpen(db: SQLiteDatabase) {
+            super.onOpen(db)
+            createAllTables(db)
+        }
+
+        private fun createAllTables(db: SQLiteDatabase) {
+            try {
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS $TABLE_MESSAGES (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        talker TEXT NOT NULL,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS idx_msg_talker_time ON $TABLE_MESSAGES(talker, timestamp)")
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS $TABLE_MEMORIES (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        scope TEXT NOT NULL,
+                        fact TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS idx_mem_scope ON $TABLE_MEMORIES(scope, timestamp)")
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS $TABLE_SELF_STATE (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        mood TEXT NOT NULL,
+                        energy INTEGER NOT NULL,
+                        activity TEXT NOT NULL,
+                        monologue TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS $TABLE_DOSSIERS (
+                        talker TEXT PRIMARY KEY,
+                        display_name TEXT NOT NULL,
+                        relationship TEXT NOT NULL,
+                        affection INTEGER NOT NULL,
+                        profile_summary TEXT NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS $TABLE_DIARY (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        mood TEXT NOT NULL,
+                        related_person TEXT NOT NULL,
+                        entry TEXT NOT NULL,
+                        timestamp INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
+                db.execSQL("CREATE INDEX IF NOT EXISTS idx_diary_time ON $TABLE_DIARY(timestamp DESC)")
+            } catch (t: Throwable) {
+                L.e("createAllTables failed", t)
+            }
         }
     }
 
@@ -664,17 +692,13 @@ object SessionManager {
             L.e("SessionManager.appendMessage failed for $talker", t)
         }
         if (role == "assistant") {
-            return turnsSinceReflection.merge(talker, 1) { old, one -> old + one } ?: 1
+            return incrementUnreflectedTurns(ctx, talker)
         }
-        return turnsSinceReflection[talker] ?: 0
-    }
-
-    fun resetReflectionCounter(talker: String) {
-        turnsSinceReflection[talker] = 0
+        return getUnreflectedTurns(ctx, talker)
     }
 
     fun clearSession(ctx: Context, talker: String): Int {
-        turnsSinceReflection.remove(talker)
+        resetReflectionCounter(ctx, talker)
         windowAnchorId.remove(talker)
         return try {
             db(ctx).delete(TABLE_MESSAGES, "talker = ?", arrayOf(talker))

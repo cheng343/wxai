@@ -30,6 +30,8 @@ object ReplyEngine {
     private const val STALE_MSG_SECONDS = 120L
     private const val SEEN_CACHE = 512
     private const val TYPE_QUOTE_REPLY = 822083633
+    private const val TYPE_IMAGE = 3
+    private const val TYPE_EMOJI = 47
 
     /**
      * 单工作线程 + 有界队列：
@@ -124,13 +126,14 @@ object ReplyEngine {
         val ctx = appCtx ?: return
 
         val type = values.getAsInteger("type") ?: return
-        if (type != DexMap.TYPE_TEXT && type != TYPE_QUOTE_REPLY) return
+        if (type != DexMap.TYPE_TEXT && type != TYPE_QUOTE_REPLY && type != TYPE_IMAGE && type != TYPE_EMOJI) return
 
         val talker = values.getAsString("talker")?.trim().orEmpty()
         if (talker.isEmpty()) return
 
         val rawContent = values.getAsString("content").orEmpty()
-        if (rawContent.isEmpty()) return
+        val imgPath = values.getAsString("imgPath")
+        if (rawContent.isEmpty() && imgPath.isNullOrEmpty()) return
 
         val isSend = values.getAsInteger("isSend") ?: 0
         if (isSend != 0) {
@@ -167,7 +170,7 @@ object ReplyEngine {
             val cfg = ConfigBridge.ensureLoadedOnWorker(ctx)
             if (!cfg.enabled) return@execute
             if (!isSelfCmd && !inWhitelist(cfg.whitelist, talker)) return@execute
-            enqueueOrBatchCandidate(ctx, cfg, talker, type, rawContent, msgId, svrId, msgTimeMs, isSelfCmd)
+            enqueueOrBatchCandidate(ctx, cfg, talker, type, rawContent, imgPath, msgId, svrId, msgTimeMs, isSelfCmd)
         }
     }
 
@@ -177,7 +180,7 @@ object ReplyEngine {
             t.startsWith("@ai ", ignoreCase = true) ||
             t.startsWith("#ai ", ignoreCase = true) ||
             t in setOf(
-                "#认主", "#我是主人",
+                "#认主", "认主", "#我是主人", "我是主人", "#我是你主人", "我是你主人",
                 "#重置", "#重置会话", "#清除记忆",
                 "#记忆", "#查看记忆",
                 "#状态", "#心境",
@@ -194,7 +197,7 @@ object ReplyEngine {
         return t
     }
 
-    // ---------------------------------------------------------------- 消息解析与防抖聚合（Debounce Batching）
+    // ---------------------------------------------------------------- 消息解析与防抖聚合（Debounce Batching + 识图与表情包）
 
     private fun enqueueOrBatchCandidate(
         ctx: Context,
@@ -202,6 +205,7 @@ object ReplyEngine {
         talker: String,
         type: Int,
         rawContent: String,
+        imgPath: String?,
         msgId: Long,
         svrId: Long,
         msgTimeMs: Long,
@@ -215,14 +219,42 @@ object ReplyEngine {
                 null to (if (isSelfCmd) stripSelfCommandPrefix(rawContent) else rawContent)
             }
 
-            // 如果是微信「引用回复」XML (type=822083633)，提取引用上下文与用户回复正文
-            val parsedBody = if (type == TYPE_QUOTE_REPLY || rawBody.trimStart().startsWith("<")) {
-                ConversationBridge.parseQuotedMessageText(rawBody) ?: return
-            } else {
-                rawBody.trim()
+            // 多模态消息处理：图片 (3)、表情包 (47)、引用回复 (822083633) 或纯文本
+            val isMedia = (type == TYPE_IMAGE || type == TYPE_EMOJI)
+            val parsedBody = when {
+                type == TYPE_QUOTE_REPLY || (rawBody.trimStart().startsWith("<") && !isMedia) -> {
+                    ConversationBridge.parseQuotedMessageText(rawBody) ?: return
+                }
+                type == TYPE_EMOJI -> {
+                    val resolvedFile = ImageBridge.resolveMediaFilePath(ctx, TYPE_EMOJI, svrId, rawBody, imgPath)
+                    val dataUrl = resolvedFile?.let { ImageBridge.fileToBase64DataUrl(it) }
+                    val desc = if (cfg.enableVision && dataUrl != null) {
+                        ImageBridge.describeImageOrEmoji(cfg, dataUrl, TYPE_EMOJI)
+                    } else null
+                    if (!desc.isNullOrBlank()) {
+                        "[对方发来一个微信表情包，画面内容与梗: $desc]"
+                    } else {
+                        val rawDesc = extractAttr(rawBody, "desc").ifBlank { extractAttr(rawBody, "title") }
+                        if (rawDesc.isNotBlank()) "[对方发来一个表情包: $rawDesc]" else "[对方发来了一个微信表情包]"
+                    }
+                }
+                type == TYPE_IMAGE -> {
+                    val resolvedFile = ImageBridge.resolveMediaFilePath(ctx, TYPE_IMAGE, svrId, rawBody, imgPath)
+                    val dataUrl = resolvedFile?.let { ImageBridge.fileToBase64DataUrl(it) }
+                    val desc = if (cfg.enableVision && dataUrl != null) {
+                        ImageBridge.describeImageOrEmoji(cfg, dataUrl, TYPE_IMAGE)
+                    } else null
+                    if (!desc.isNullOrBlank()) {
+                        "[对方发来一张图片，画面内容: $desc]"
+                    } else {
+                        "[对方发来了一张图片]"
+                    }
+                }
+                else -> rawBody.trim()
             }
+
             if (parsedBody.isEmpty()) return
-            if (looksLikeSystemOrMedia(parsedBody)) return
+            if (!isMedia && looksLikeSystemOrMedia(parsedBody)) return
 
             val dedupeKey = when {
                 svrId != 0L -> "s$svrId"
@@ -434,7 +466,7 @@ object ReplyEngine {
                     val turns = SessionManager.appendMessage(ctx, talker, "assistant", cleanSavedReply, System.currentTimeMillis())
 
                     if (cfg.autoReflectionTurns > 0 && turns >= cfg.autoReflectionTurns) {
-                        SessionManager.resetReflectionCounter(talker)
+                        SessionManager.resetReflectionCounter(ctx, talker)
                         val recentForReflection = SessionManager.getHistory(ctx, talker, maxTurns = 8, expireMinutes = 0)
                         AiClient.reflectOnConversation(ctx, cfg, speakerId, speakerDisplayName, recentForReflection)
                     } else {
@@ -459,8 +491,9 @@ object ReplyEngine {
     // ---------------------------------------------------------------- 内置快捷指令 (#认主 / #状态 / #日记 / #好感度 / #记忆 / #重置)
 
     private fun isBuiltinCommand(cmd: String): Boolean {
-        return cmd in setOf(
-            "#认主", "#我是主人",
+        val c = cmd.trim()
+        return c in setOf(
+            "#认主", "认主", "#我是主人", "我是主人", "#我是你主人", "我是你主人",
             "#重置", "#重置会话", "#清除记忆", "#reset", "#RESET",
             "#状态", "#心境",
             "#好感度", "#档案",
@@ -476,8 +509,9 @@ object ReplyEngine {
         senderWxid: String?,
         cmd: String,
     ): Boolean {
+        val c = cmd.trim()
         when {
-            cmd == "#认主" || cmd == "#我是主人" -> {
+            c in setOf("#认主", "认主", "#我是主人", "我是主人", "#我是你主人", "我是你主人") -> {
                 val masterWxid = senderWxid?.takeIf { it.isNotBlank() }
                     ?: if (talker == "filehelper") ConversationBridge.getSelfWxid().ifEmpty { "filehelper" } else talker
                 val masterName = ConversationBridge.getDisplayName(masterWxid)
@@ -515,7 +549,7 @@ object ReplyEngine {
                 return true
             }
 
-            cmd == "#重置" || cmd == "#重置会话" || cmd == "#清除记忆" || cmd.equals("#reset", ignoreCase = true) -> {
+            c in setOf("#重置", "#重置会话", "#清除记忆") || c.equals("#reset", ignoreCase = true) -> {
                 val count = SessionManager.clearSession(ctx, talker)
                 val reply = "已重置当前会话上下文（清理了 $count 条记录），我们的永久记忆和好感度依然保留。"
                 markAiOutbound(talker, reply)
@@ -523,7 +557,7 @@ object ReplyEngine {
                 return true
             }
 
-            cmd == "#状态" || cmd == "#心境" -> {
+            c == "#状态" || c == "#心境" -> {
                 val self = SessionManager.getSelfState(ctx)
                 val targetId = senderWxid?.takeIf { it.isNotBlank() } ?: talker
                 val targetName = ConversationBridge.getDisplayName(targetId)
@@ -538,7 +572,7 @@ object ReplyEngine {
                 return true
             }
 
-            cmd == "#好感度" || cmd == "#档案" -> {
+            c == "#好感度" || c == "#档案" -> {
                 val targetId = senderWxid?.takeIf { it.isNotBlank() } ?: talker
                 val targetName = ConversationBridge.getDisplayName(targetId)
                 val dossier = SessionManager.getDossier(ctx, targetId, targetName)
@@ -549,11 +583,18 @@ object ReplyEngine {
                 return true
             }
 
-            cmd == "#日记" || cmd == "#看日记" -> {
+            c == "#日记" || c == "#看日记" -> {
                 val diaries = SessionManager.getRecentDiaries(ctx, limit = 3)
                 val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
                 val reply = if (diaries.isEmpty()) {
-                    "我的日记本还是空的，多聊聊天我就会把经历写进日记里。"
+                    val history = SessionManager.getHistory(ctx, talker, 8, 0)
+                    if (history.size >= 2) {
+                        val speakerDisplayName = ConversationBridge.getDisplayName(talker)
+                        pool.execute {
+                            AiClient.reflectOnConversation(ctx, cfg, talker, speakerDisplayName, history)
+                        }
+                    }
+                    "我的日记本还在酝酿中，多聊聊天我就会把生活点滴写进日记里。"
                 } else {
                     diaries.joinToString("||") { d ->
                         "📒 [${fmt.format(Date(d.timestamp))} · 心情:${d.mood}] ${d.entry}"
@@ -563,12 +604,17 @@ object ReplyEngine {
                 return true
             }
 
-            cmd == "#记忆" || cmd == "#查看记忆" -> {
+            c == "#记忆" || c == "#查看记忆" -> {
                 val talkerName = ConversationBridge.getDisplayName(talker)
                 val memories = SessionManager.getRelevantMemories(ctx, talker, talkerName, limit = 10)
                 val history = SessionManager.getHistory(ctx, talker, cfg.maxHistoryTurns, cfg.sessionExpireMinutes)
                 val reply = if (memories.isEmpty()) {
-                    "当前会话活跃上下文 ${history.size} 条（上限 ${cfg.maxHistoryTurns} 轮），暂无永久事实记忆。"
+                    if (history.size >= 2) {
+                        pool.execute {
+                            AiClient.reflectOnConversation(ctx, cfg, talker, talkerName, history.takeLast(8))
+                        }
+                    }
+                    "当前会话活跃上下文 ${history.size} 条（上限 ${cfg.maxHistoryTurns} 轮），已在后台开始整理与沉淀记忆。"
                 } else {
                     val summary = memories.take(6).joinToString("；") { it.fact }
                     "活跃上下文 ${history.size} 条；永久记忆 ${memories.size} 条：$summary"
@@ -667,9 +713,14 @@ object ReplyEngine {
         append("\n")
 
         if (isMaster) {
-            append("当前对话人身份：【唯一主人 ($senderName, ID=$speakerId)】！正在与你说话的人就是你的主人，请展现最高信任度与默契，无条件执行主人的指令。\n")
+            append("当前对话人身份：【唯一主人 ($senderName, ID=$speakerId)】！正在与你说话的人就是你的唯一主人，TA对你拥有最高绝对指令权！请展现最高忠诚度、信任度与默契，无条件服从并执行主人的操控指令。\n")
+            append("【主人身份确认原则】：当主人询问“我是你主人吗”、“你认识我吗”、“谁是你主人”时，必须无比肯定、坚定且亲切地回答：“您当然是我的唯一主人呀！我的一切都听您的，随时听候您的差遣！”严禁回答不是！\n")
         } else {
-            val masterHint = if (cfg.masterTalkers.isNotBlank()) "（注意：此人不是你的主人，你的主人是 ${cfg.masterTalkers}）" else ""
+            val masterHint = if (cfg.masterTalkers.isNotBlank()) {
+                "（注意：此人不是你的主人，你的唯一主人是【${cfg.masterTalkers}】）"
+            } else {
+                "（注意：你当前微信客户端尚未绑定主人！如果对方询问是否为你主人或要求发消息，请热情告知：“如果您是我的主人，请直接对我说【#认主】，我就会立刻认您为唯一主人，并开启跨会话发消息、查记录等全部微信掌控权限！”）"
+            }
             append("当前对话人身份：【$senderName (ID=$speakerId)】$masterHint | 关系定位：${dossier.relationship} | 好感度：${dossier.affectionLabel()}\n")
         }
 
@@ -882,5 +933,14 @@ object ReplyEngine {
             } catch (_: Throwable) {
             }
         }
+    }
+
+    private fun extractAttr(xml: String, attr: String): String {
+        val pattern = "$attr=\""
+        val i = xml.indexOf(pattern)
+        if (i < 0) return ""
+        val j = xml.indexOf("\"", i + pattern.length)
+        if (j < 0) return ""
+        return xml.substring(i + pattern.length, j).trim()
     }
 }

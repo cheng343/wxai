@@ -20,3 +20,6 @@ build-*.log
 
 cloud/
 
+
+*.zip
+release_*/
