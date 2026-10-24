@@ -19,6 +19,10 @@ object ConversationClient {
     /** 读本地缓存的快照（不发广播，可能在 stale）。界面首次渲染用它。 */
     fun peek(ctx: Context): ConvSnapshot = Prefs.loadConversations(ctx)
 
+    /** 读取本地缓存的数字生命档案快照（心境、好感度、日记、记忆）。 */
+    fun peekLifeSnapshot(ctx: Context): SessionManager.LifeSnapshot =
+        SessionManager.LifeSnapshot.fromJson(Prefs.loadLifeSnapshotRaw(ctx))
+
     /** 请求微信进程重新枚举一次。返回是否成功把广播发出去。 */
     fun requestRefresh(ctx: Context): Boolean {
         return try {

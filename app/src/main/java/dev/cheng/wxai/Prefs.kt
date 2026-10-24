@@ -19,6 +19,9 @@ object Prefs {
     /** 微信进程推上来的会话列表快照（ConvSnapshot.toJson()） */
     const val KEY_CONVERSATIONS_JSON = "conversations_json"
 
+    /** 微信进程推上来的数字生命状态快照（心境、人生日记、社交好感度、长期记忆） */
+    const val KEY_LIFE_SNAPSHOT_JSON = "life_snapshot_json"
+
     /**
      * 读配置。任何异常（含 SP 损坏、Config.fromJson 内部 L 在模块 App 进程里抛
      * NoClassDefFoundError）都回落到 Config.DEFAULT（enabled=false，安全默认）。
@@ -70,6 +73,18 @@ object Prefs {
     /** 写会话列表快照（由 ConfigProvider 在微信进程调用 update() 时落盘）。 */
     fun saveConversations(ctx: Context, rawJson: String) {
         prefs(ctx).edit().putString(KEY_CONVERSATIONS_JSON, rawJson).apply()
+    }
+
+    fun loadLifeSnapshotRaw(ctx: Context): String? {
+        return try {
+            prefs(ctx).getString(KEY_LIFE_SNAPSHOT_JSON, null)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    fun saveLifeSnapshotRaw(ctx: Context, rawJson: String) {
+        prefs(ctx).edit().putString(KEY_LIFE_SNAPSHOT_JSON, rawJson).apply()
     }
 
     private fun prefs(ctx: Context): SharedPreferences {

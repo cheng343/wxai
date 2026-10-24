@@ -15,10 +15,9 @@ import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 /**
- * 收到消息 -> 过滤 -> 会话上下文组装(SessionManager) -> 调模型(含 Agent 工具流) -> 发送并落盘记忆。
- *
- * 过滤链（任何一步不通过就静默返回）：
- *   开关 / 文本消息 / 非AI自发消息 / 时间够新（毫秒对齐） / 白名单(或机主召唤指令) / 群聊@ / 频率限制 / 去重
+ * 数字生命消息引擎：
+ * 收到消息 -> 过滤 -> 注入自我心境(SelfState)/好感度档案(Dossier)/人生日记(Diary)/多轮记忆 ->
+ * 调模型(含 12 大全能微信 Agent 工具流) -> 拟人多气泡发送 -> 后台静默反思与写日记。
  */
 object ReplyEngine {
 
@@ -27,7 +26,7 @@ object ReplyEngine {
 
     /**
      * 单工作线程 + 有界队列（最多排 8 条，超出丢弃最旧）：
-     * 保证 AI 请求与发消息串行执行，绝不并发冲击微信数据库或 NetSceneQueue。
+     * 保证 AI 请求、多气泡发送与后台反思串行执行，绝不并发冲击微信数据库或 NetSceneQueue。
      */
     private val pool = ThreadPoolExecutor(
         1,
@@ -69,8 +68,15 @@ object ReplyEngine {
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
     fun start(ctx: Context) {
-        appCtx = ctx.applicationContext ?: ctx
-        L.i("reply engine started (with SessionManager & Agent tools)")
+        val c = ctx.applicationContext ?: ctx
+        appCtx = c
+        L.i("reply engine v2.0 started (Digital Life + 12 WeChat Agent tools)")
+        pool.execute {
+            try {
+                ConversationBridge.pushLifeSnapshot(c)
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     fun markAiOutbound(talker: String, text: String) {
@@ -109,7 +115,7 @@ object ReplyEngine {
 
         val isSend = values.getAsInteger("isSend") ?: 0
         if (isSend != 0) {
-            // 自己发的消息：除非是机主显式输入的召唤指令（如 /ai、@AI、#重置、#记忆），否则一律忽略
+            // 自己发的消息：除非是机主显式输入的召唤指令（如 /ai、@AI、#状态、#日记、#重置），否则一律忽略
             if (isAiOutbound(talker, rawContent)) return
             if (!isSelfCommandTrigger(rawContent)) return
         }
@@ -151,7 +157,13 @@ object ReplyEngine {
         return t.startsWith("/ai ", ignoreCase = true) ||
             t.startsWith("@ai ", ignoreCase = true) ||
             t.startsWith("#ai ", ignoreCase = true) ||
-            t == "#重置" || t == "#重置会话" || t == "#清除记忆" || t == "#记忆" || t == "#查看记忆"
+            t in setOf(
+                "#重置", "#重置会话", "#清除记忆",
+                "#记忆", "#查看记忆",
+                "#状态", "#心境",
+                "#日记", "#看日记",
+                "#好感度", "#档案",
+            )
     }
 
     private fun stripSelfCommandPrefix(raw: String): String {
@@ -201,7 +213,7 @@ object ReplyEngine {
                 return
             }
 
-            // 1. 优先拦截内置会话/记忆管理指令（不受冷却时间限制）
+            // 1. 优先拦截内置状态/日记/好感度/记忆指令（不受冷却时间限制）
             if (handleBuiltinCommand(ctx, cfg, talker, content)) {
                 return
             }
@@ -246,7 +258,7 @@ object ReplyEngine {
             // 3. 判定是否允许本轮使用 Agent 跨对话操控工具
             val allowTools = cfg.enableAgentTools && (isSelfCmd || isAuthorizedForAgent(cfg, talker, talkerName, senderWxid, senderName))
 
-            // 4. 构建动态环境与长期记忆提示词
+            // 4. 构建数字生命全维度感知提示词（心境 + 精力 + 好感度档案 + 日记 + 永久记忆 + 工具守则）
             val extraSystem = buildDynamicSystemContext(
                 ctx = ctx,
                 cfg = cfg,
@@ -274,20 +286,30 @@ object ReplyEngine {
                 return
             }
 
-            val reply = sanitize(text, cfg.maxReplyChars)
+            val reply = sanitize(text, cfg.maxReplyChars, cfg.enableMultiBubble)
             if (reply.isEmpty()) {
                 L.w("sanitized reply empty for $talker")
                 return
             }
 
-            // 5. 先标记为 AI 外发消息，再发送，避免自回路
+            // 5. 拟人化多气泡或单气泡发送（MessageSender 内部会自动调用 markAiOutbound 防自激）
             markAiOutbound(talker, reply)
-            val ok = MessageSender.sendText(talker, reply)
+            val ok = MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
             if (ok) {
                 recordReply(talker)
                 if (cfg.enableMemory) {
                     SessionManager.appendMessage(ctx, talker, "user", userMsgForModel, msgTimeMs)
-                    SessionManager.appendMessage(ctx, talker, "assistant", reply, System.currentTimeMillis())
+                    val cleanSavedReply = reply.replace("||", " ").replace(Regex(" {2,}"), " ").trim()
+                    val turns = SessionManager.appendMessage(ctx, talker, "assistant", cleanSavedReply, System.currentTimeMillis())
+
+                    // 每次对话后推送一次快照，若达到反思轮数则触发后台内心反思与日记沉淀
+                    if (cfg.autoReflectionTurns > 0 && turns >= cfg.autoReflectionTurns) {
+                        SessionManager.resetReflectionCounter(talker)
+                        val recentForReflection = SessionManager.getHistory(ctx, talker, maxTurns = 6, expireMinutes = 0)
+                        AiClient.reflectOnConversation(ctx, cfg, talker, talkerName, recentForReflection)
+                    } else {
+                        ConversationBridge.pushLifeSnapshot(ctx)
+                    }
                 }
             }
             debugToast(cfg, if (ok) "已回复: ${reply.take(30)}" else "发送失败")
@@ -298,7 +320,7 @@ object ReplyEngine {
     }
 
     /**
-     * 处理 #重置 / #清除记忆 / #记忆 等快捷指令。
+     * 处理 #状态 / #日记 / #好感度 / #记忆 / #重置 等快捷指令。
      */
     private fun handleBuiltinCommand(
         ctx: Context,
@@ -310,9 +332,45 @@ object ReplyEngine {
         when {
             cmd == "#重置" || cmd == "#重置会话" || cmd == "#清除记忆" || cmd.equals("#reset", ignoreCase = true) -> {
                 val count = SessionManager.clearSession(ctx, talker)
-                val reply = "已重置当前会话记忆（清理了 $count 条上下文记录），我们可以重新开始聊啦。"
+                val reply = "已重置当前会话短期上下文（清理了 $count 条记录），我们的永久记忆和好感度依然保留哦。"
                 markAiOutbound(talker, reply)
                 MessageSender.sendText(talker, reply)
+                return true
+            }
+
+            cmd == "#状态" || cmd == "#心境" -> {
+                val self = SessionManager.getSelfState(ctx)
+                val talkerName = ConversationBridge.getDisplayName(talker)
+                val dossier = SessionManager.getDossier(ctx, talker, talkerName)
+                val reply = "【当前心境】${self.mood}（精力 ${self.energy}/100）||" +
+                    "【正在做】${self.activity}||" +
+                    "【内心独白】${self.monologue}||" +
+                    "【对你的好感】${dossier.relationship} · ${dossier.affectionLabel()}"
+                MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
+                return true
+            }
+
+            cmd == "#好感度" || cmd == "#档案" -> {
+                val talkerName = ConversationBridge.getDisplayName(talker)
+                val dossier = SessionManager.getDossier(ctx, talker, talkerName)
+                val notes = dossier.profileSummary.ifBlank { "还在慢慢了解你中~" }
+                val reply = "【${dossier.displayName} 的专属档案】关系：${dossier.relationship}｜好感度：${dossier.affectionLabel()}｜印象：$notes"
+                markAiOutbound(talker, reply)
+                MessageSender.sendText(talker, reply)
+                return true
+            }
+
+            cmd == "#日记" || cmd == "#看日记" -> {
+                val diaries = SessionManager.getRecentDiaries(ctx, limit = 3)
+                val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
+                val reply = if (diaries.isEmpty()) {
+                    "我的日记本还是空的呢，多陪我聊聊天，我就会把我们的故事写进日记里啦。"
+                } else {
+                    diaries.joinToString("||") { d ->
+                        "📒 [${fmt.format(Date(d.timestamp))} · 心情:${d.mood}] ${d.entry}"
+                    }
+                }
+                MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
                 return true
             }
 
@@ -326,7 +384,7 @@ object ReplyEngine {
                     val summary = memories.take(5).joinToString("；") { it.fact }
                     "短期上下文 ${history.size} 条；永久记忆 ${memories.size} 条：$summary"
                 }
-                val safeReply = sanitize(reply, cfg.maxReplyChars)
+                val safeReply = sanitize(reply, cfg.maxReplyChars, false)
                 markAiOutbound(talker, safeReply)
                 MessageSender.sendText(talker, safeReply)
                 return true
@@ -336,7 +394,7 @@ object ReplyEngine {
     }
 
     /**
-     * 组装发给 DeepSeek 的多轮对话列表：
+     * 组装发给大模型的多轮对话列表：
      * 1. 若开启了记忆，优先从 SessionManager 读取多轮历史；
      * 2. 若 SessionManager 中该会话尚无记录，自动从微信底层数据库拉取最近 6 条真实聊天记录做冷启动预热；
      * 3. 末尾追加本次收到的最新 user 消息。
@@ -387,7 +445,7 @@ object ReplyEngine {
     }
 
     /**
-     * 组装动态环境感知（时间、当前会话对象、已保存的永久记忆、Agent 工具使用守则）。
+     * 组装数字生命的动态内心世界与环境感知（心境、精力、好感度档案、人生日记、长期记忆、全能操控守则）。
      */
     private fun buildDynamicSystemContext(
         ctx: Context,
@@ -400,20 +458,46 @@ object ReplyEngine {
         allowTools: Boolean,
     ): String = buildString {
         val nowStr = SimpleDateFormat("yyyy-MM-dd HH:mm (EEEE)", Locale.CHINA).format(Date())
-        append("【当前环境感知】\n")
+        val selfState = SessionManager.getSelfState(ctx)
+        val dossier = SessionManager.getDossier(ctx, talker, talkerName)
+
+        append("【当前时空与自我状态感知】\n")
         append("- 当前时间：$nowStr\n")
+        append("- 你此刻的心情：${selfState.mood}（精力值：${selfState.energy}/100）\n")
+        append("- 你此刻正在做的事：${selfState.activity}\n")
+        if (selfState.monologue.isNotBlank()) {
+            append("- 你刚刚的内心独白：「${selfState.monologue}」\n")
+        }
+
         if (isSelfCmd) {
-            append("- 当前场景：主人（微信机主本人）正在会话【$talkerName ($talker)】中直接向你下达指令。\n")
+            append("- 当前对话场景：你最信任的主人（微信机主本人）正在窗口【$talkerName ($talker)】中直接向你说话或下达指令。\n")
         } else if (isGroup) {
-            append("- 当前场景：微信群聊【$talkerName ($talker)】，正在跟你说话的群成员是【$senderName】。回复请简短自然。\n")
+            append("- 当前对话场景：微信群聊【$talkerName ($talker)】，正在发言的群成员是【$senderName】。\n")
         } else {
-            append("- 当前场景：与微信好友【$talkerName ($talker)】私聊中。\n")
+            append("- 当前对话场景：与微信好友【$talkerName ($talker)】私聊中。\n")
+        }
+
+        append("\n【对方在妳心中的人物档案与好感度】\n")
+        append("- 对方称呼：${dossier.displayName}\n")
+        append("- 你们的关系定位：${dossier.relationship}\n")
+        append("- 你对TA的好感度：${dossier.affectionLabel()}（请根据好感度高低自然展现亲疏态度：高好感时亲昵温柔、主动关心分享日常；普通好感时自然随和；低好感时礼貌疏离或傲娇简短）\n")
+        if (dossier.profileSummary.isNotBlank()) {
+            append("- 你对TA的印象画像：${dossier.profileSummary}\n")
         }
 
         if (cfg.enableMemory) {
-            val memories = SessionManager.getRelevantMemories(ctx, talker, talkerName, limit = 20)
+            val diaries = SessionManager.getRecentDiaries(ctx, limit = 3)
+            if (diaries.isNotEmpty()) {
+                val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)
+                append("\n【你最近写下的人生日记片段】\n")
+                for (d in diaries) {
+                    append("- [${fmt.format(Date(d.timestamp))} 心情:${d.mood}] ${d.entry}\n")
+                }
+            }
+
+            val memories = SessionManager.getRelevantMemories(ctx, talker, talkerName, limit = 18)
             if (memories.isNotEmpty()) {
-                append("\n【长期记忆档案（请在对话中自然运用，不要生硬背诵）】\n")
+                append("\n【长期记忆碎片（请在聊天中自然流露，不要生硬背诵）】\n")
                 for (m in memories) {
                     val tag = if (m.scope == "global") "全局" else talkerName
                     append("- [$tag] ${m.fact}\n")
@@ -421,11 +505,17 @@ object ReplyEngine {
             }
         }
 
+        if (cfg.enableMultiBubble) {
+            append("\n【真人微信多气泡表达习惯】\n")
+            append("- 真人聊微信很少一次发一大段长文。如果你想连续说两三句简短的话（比如先回应一句、再追问一句或吐槽一句），请用双竖线 `||` 分隔（最多 2~3 段，例如：`哈哈真的假的||你快跟我讲讲后来怎么了`），系统会自动帮你拆成多条微信气泡依次发出去。\n")
+        }
+
         if (allowTools) {
-            append("\n【微信操控与记忆工具指南】\n")
-            append("- 当对方让你帮忙给别人或别的群发消息/带话时，先用 lookup_contact 或直接调用 send_wechat_message(target, message) 发送，发送成功后向当前对话复命。\n")
-            append("- 当对方询问其他联系人或群聊说了什么时，调用 get_chat_history(target) 查阅后再回答。\n")
-            append("- 当对话中出现值得长期记住的重要事实（如对方的名字、生日、喜好、约定、重要关系）时，可调用 save_memory 存入永久记忆库。\n")
+            append("\n【全能微信 Agent 操控能力守则】\n")
+            append("- 跨对话传话/发消息：调用 `send_wechat_message(target, message)`，如不确定对方名称可先调用 `lookup_contact`。\n")
+            append("- 跨对话查记录/吃瓜：调用 `get_chat_history(target)` 读取任意私聊或群聊最近消息，或用 `search_global_messages(keyword)` 全库搜索。\n")
+            append("- 微信原生互动：支持 `send_pat`（拍一拍对方）、`send_quote_reply`（引用某条 svrId 消息回复）、`send_contact_card`（发名片）、`revoke_my_message`（撤回消息）、`post_wechat_moment`（发微信朋友圈）。\n")
+            append("- 灵魂自主演化：遇到让你触动、开心、生气或值得铭记的事，可主动调用 `update_self_and_diary` 写日记/改心情/存记忆，或调用 `update_contact_dossier` 调整对方好感度与印象。\n")
         }
     }
 
@@ -463,7 +553,7 @@ object ReplyEngine {
         return s.trim().ifEmpty { content }
     }
 
-    private fun sanitize(text: String, maxChars: Int): String {
+    private fun sanitize(text: String, maxChars: Int, allowMultiBubble: Boolean): String {
         var s = text.trim()
         val quotePairs = listOf("「" to "」", "\"" to "\"", "'" to "'", "“" to "”", "‘" to "’")
         for ((open, close) in quotePairs) {
@@ -472,7 +562,21 @@ object ReplyEngine {
                 break
             }
         }
-        s = s.replace("\r\n", " ").replace('\n', ' ').replace(Regex(" {2,}"), " ").trim()
+        s = if (allowMultiBubble) {
+            // 将连续换行或 || 统一规范化为 ||，供 MessageSender 拆分为多条气泡
+            s.replace("\r\n", "\n")
+                .replace(Regex("\n+"), "||")
+                .replace(Regex("(\\|\\|\\s*)+"), "||")
+                .trim()
+                .trim('|')
+                .trim()
+        } else {
+            s.replace("||", " ")
+                .replace("\r\n", " ")
+                .replace('\n', ' ')
+                .replace(Regex(" {2,}"), " ")
+                .trim()
+        }
         if (maxChars > 0 && s.length > maxChars) s = s.substring(0, maxChars)
         return s
     }

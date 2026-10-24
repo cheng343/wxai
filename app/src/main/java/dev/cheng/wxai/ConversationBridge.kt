@@ -39,10 +39,21 @@ object ConversationBridge {
     private val displayNameCache = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     data class WechatMessageRecord(
+        val msgId: Long = 0L,
+        val msgSvrId: Long = 0L,
+        val senderWxid: String = "",
         val senderName: String,
         val isSelf: Boolean,
         val content: String,
         val type: Int,
+        val createTimeMs: Long,
+    )
+
+    data class GlobalMessageHit(
+        val talker: String,
+        val talkerName: String,
+        val senderName: String,
+        val content: String,
         val createTimeMs: Long,
     )
 
@@ -411,7 +422,7 @@ object ConversationBridge {
         val esc = sqlEscape(cleanTalker)
         val isGroup = cleanTalker.endsWith("@chatroom")
         val sql = """
-            SELECT isSend, type, content, createTime
+            SELECT msgId, msgSvrId, isSend, type, content, createTime
             FROM message
             WHERE talker = '$esc'
             ORDER BY createTime DESC
@@ -422,20 +433,23 @@ object ConversationBridge {
         try {
             rawQuery(db, sql)?.use { cur ->
                 while (cur.moveToNext()) {
-                    val isSend = if (cur.isNull(0)) 0 else cur.getInt(0)
-                    val type = if (cur.isNull(1)) 0 else cur.getInt(1)
-                    val rawContent = if (cur.isNull(2)) "" else cur.getString(2).orEmpty()
-                    val createTime = if (cur.isNull(3)) 0L else cur.getLong(3)
+                    val msgId = if (cur.isNull(0)) 0L else cur.getLong(0)
+                    val msgSvrId = if (cur.isNull(1)) 0L else cur.getLong(1)
+                    val isSend = if (cur.isNull(2)) 0 else cur.getInt(2)
+                    val type = if (cur.isNull(3)) 0 else cur.getInt(3)
+                    val rawContent = if (cur.isNull(4)) "" else cur.getString(4).orEmpty()
+                    val createTime = if (cur.isNull(5)) 0L else cur.getLong(5)
                     val timeMs = if (createTime in 1L..9_999_999_999L) createTime * 1000L else createTime
 
                     val isSelf = isSend != 0
+                    var senderWxid = if (isSelf) "self" else cleanTalker
                     var sender = if (isSelf) "我" else getDisplayName(cleanTalker)
                     var body = rawContent
 
                     if (isGroup && !isSelf) {
                         val idx = rawContent.indexOf(":\n")
                         if (idx in 1..80) {
-                            val senderWxid = rawContent.substring(0, idx).trim()
+                            senderWxid = rawContent.substring(0, idx).trim()
                             sender = getDisplayName(senderWxid)
                             body = rawContent.substring(idx + 2).trim()
                         }
@@ -454,6 +468,9 @@ object ConversationBridge {
                     if (readableBody.isNotEmpty()) {
                         rawReversed.add(
                             WechatMessageRecord(
+                                msgId = msgId,
+                                msgSvrId = msgSvrId,
+                                senderWxid = senderWxid,
                                 senderName = sender,
                                 isSelf = isSelf,
                                 content = readableBody,
@@ -468,6 +485,105 @@ object ConversationBridge {
             L.e("$TAG queryWechatMessages($cleanTalker) failed", t)
         }
         return rawReversed.asReversed()
+    }
+
+    /**
+     * 获取指定群聊（@chatroom）的所有成员列表（含 wxid、昵称/备注）。
+     */
+    fun getGroupMembers(groupTalker: String, limit: Int = 60): List<ConvEntry> {
+        val db = ensureDb() ?: return emptyList()
+        val clean = groupTalker.trim()
+        if (!clean.endsWith("@chatroom")) return emptyList()
+
+        val esc = sqlEscape(clean)
+        var memberListStr = ""
+        try {
+            rawQuery(db, "SELECT memberlist FROM chatroom WHERE chatroomname = '$esc' LIMIT 1")?.use { cur ->
+                if (cur.moveToFirst() && !cur.isNull(0)) {
+                    memberListStr = cur.getString(0).orEmpty()
+                }
+            }
+        } catch (t: Throwable) {
+            L.w("$TAG getGroupMembers($clean) failed: ${t.message}")
+        }
+        if (memberListStr.isBlank()) return emptyList()
+
+        val wxids = memberListStr.split(';', ',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .take(limit.coerceIn(1, 150))
+
+        return wxids.map { wxid ->
+            ConvEntry(
+                username = wxid,
+                name = getDisplayName(wxid),
+                isGroup = false,
+                unread = 0,
+                lastTime = 0L,
+            )
+        }
+    }
+
+    /**
+     * 在微信全量历史消息表 (message) 中按关键词检索消息记录（跨所有私聊与群聊）。
+     */
+    fun searchGlobalMessages(keyword: String, limit: Int = 20): List<GlobalMessageHit> {
+        val db = ensureDb() ?: return emptyList()
+        val q = keyword.trim()
+        if (q.isEmpty()) return emptyList()
+
+        val safeLimit = limit.coerceIn(1, 40)
+        val esc = sqlEscape(q)
+        val sql = """
+            SELECT talker, isSend, content, createTime
+            FROM message
+            WHERE type = ${DexMap.TYPE_TEXT}
+              AND content LIKE '%$esc%'
+            ORDER BY createTime DESC
+            LIMIT $safeLimit
+        """.trimIndent()
+
+        val hits = ArrayList<GlobalMessageHit>()
+        try {
+            rawQuery(db, sql)?.use { cur ->
+                while (cur.moveToNext()) {
+                    val talker = if (cur.isNull(0)) "" else cur.getString(0).orEmpty()
+                    if (talker.isEmpty()) continue
+                    val isSend = if (cur.isNull(1)) 0 else cur.getInt(1)
+                    val rawContent = if (cur.isNull(2)) "" else cur.getString(2).orEmpty()
+                    val createTime = if (cur.isNull(3)) 0L else cur.getLong(3)
+                    val timeMs = if (createTime in 1L..9_999_999_999L) createTime * 1000L else createTime
+
+                    val talkerName = getDisplayName(talker)
+                    val isGroup = talker.endsWith("@chatroom")
+                    val isSelf = isSend != 0
+                    var sender = if (isSelf) "我" else talkerName
+                    var body = rawContent
+
+                    if (isGroup && !isSelf) {
+                        val idx = rawContent.indexOf(":\n")
+                        if (idx in 1..80) {
+                            val senderWxid = rawContent.substring(0, idx).trim()
+                            sender = getDisplayName(senderWxid)
+                            body = rawContent.substring(idx + 2).trim()
+                        }
+                    }
+
+                    hits.add(
+                        GlobalMessageHit(
+                            talker = talker,
+                            talkerName = talkerName,
+                            senderName = sender,
+                            content = body.trim().take(160),
+                            createTimeMs = timeMs,
+                        )
+                    )
+                }
+            }
+        } catch (t: Throwable) {
+            L.e("$TAG searchGlobalMessages($q) failed", t)
+        }
+        return hits
     }
 
     private fun rawQuery(db: Any, sql: String): Cursor? {
@@ -508,6 +624,20 @@ object ConversationBridge {
             L.i("$TAG pushed ${snap.items.size} conversations (error=${snap.error}), rows=$rows")
         } catch (t: Throwable) {
             L.e("$TAG push to ${ConfigProvider.AUTHORITY} failed", t)
+        }
+        pushLifeSnapshot(ctx)
+    }
+
+    fun pushLifeSnapshot(ctx: Context) {
+        try {
+            val lifeJson = SessionManager.exportLifeSnapshotJson(ctx)
+            val values = ContentValues().apply {
+                put(ConfigProvider.COLUMN_JSON, lifeJson)
+            }
+            val uri = Uri.parse("content://${ConfigProvider.AUTHORITY}/${ConfigProvider.PATH_LIFE_SNAPSHOT}")
+            ctx.contentResolver.update(uri, values, null, null)
+        } catch (t: Throwable) {
+            L.w("$TAG pushLifeSnapshot skipped: ${t.message}")
         }
     }
 

@@ -44,6 +44,8 @@ class ConfigProvider : ContentProvider() {
          */
         const val PATH_CONVERSATIONS = "conversations"
 
+        const val PATH_LIFE_SNAPSHOT = "life_snapshot"
+
         /** 唯一一列的列名，ConfigBridge 按这个名字取值。 */
         const val COLUMN_JSON = "json"
 
@@ -55,6 +57,9 @@ class ConfigProvider : ContentProvider() {
 
         /** 会话快照信箱的 Uri（微信进程 update，App query）。 */
         fun conversationsUri(): Uri = Uri.parse("content://$AUTHORITY/$PATH_CONVERSATIONS")
+
+        /** 数字生命档案信箱的 Uri（微信进程 update，App query）。 */
+        fun lifeSnapshotUri(): Uri = Uri.parse("content://$AUTHORITY/$PATH_LIFE_SNAPSHOT")
     }
 
     override fun onCreate(): Boolean = true
@@ -77,11 +82,10 @@ class ConfigProvider : ContentProvider() {
         }
 
         val json = try {
-            if (uri.lastPathSegment == PATH_CONVERSATIONS) {
-                // 会话快照信箱：返回上一次微信进程推上来的 JSON（可能是空快照）
-                Prefs.loadConversations(ctx).toJson()
-            } else {
-                Prefs.load(ctx).toJson().toString()
+            when (uri.lastPathSegment) {
+                PATH_CONVERSATIONS -> Prefs.loadConversations(ctx).toJson()
+                PATH_LIFE_SNAPSHOT -> Prefs.loadLifeSnapshotRaw(ctx).orEmpty()
+                else -> Prefs.load(ctx).toJson().toString()
             }
         } catch (t: Throwable) {
             Log.e(TAG, "build json failed for $uri", t)
@@ -100,9 +104,9 @@ class ConfigProvider : ContentProvider() {
     override fun delete(uri: Uri, selection: String?, selectionArgs: Array<out String>?): Int = 0
 
     /**
-     * 唯一的写路径：微信进程推会话快照。
+     * 唯一的写路径：微信进程推会话快照或数字生命快照。
      *
-     * 只接受 /conversations，且调用方必须是微信或本 App；
+     * 只接受 /conversations 与 /life_snapshot，且调用方必须是微信或本 App；
      * 其他 App 即使猜到 authority 也写不进来（isTrustedCaller 挡）。
      */
     override fun update(
@@ -111,7 +115,8 @@ class ConfigProvider : ContentProvider() {
         selection: String?,
         selectionArgs: Array<out String>?,
     ): Int {
-        if (uri.lastPathSegment != PATH_CONVERSATIONS) {
+        val seg = uri.lastPathSegment
+        if (seg != PATH_CONVERSATIONS && seg != PATH_LIFE_SNAPSHOT) {
             Log.w(TAG, "update ignored for $uri")
             return 0
         }
@@ -122,10 +127,14 @@ class ConfigProvider : ContentProvider() {
         val ctx = context ?: return 0
         val raw = values?.getAsString(COLUMN_JSON) ?: return 0
         return try {
-            Prefs.saveConversations(ctx, raw)
+            if (seg == PATH_LIFE_SNAPSHOT) {
+                Prefs.saveLifeSnapshotRaw(ctx, raw)
+            } else {
+                Prefs.saveConversations(ctx, raw)
+            }
             1
         } catch (t: Throwable) {
-            Log.e(TAG, "save conversations failed", t)
+            Log.e(TAG, "save snapshot failed ($seg)", t)
             0
         }
     }
