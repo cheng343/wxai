@@ -11,8 +11,8 @@ android {
         applicationId = "dev.cheng.wxai"
         minSdk = 26
         targetSdk = 34
-        versionCode = 8
-        versionName = "1.2.5"
+        versionCode = 9
+        versionName = "1.2.6"
     }
 
     buildFeatures {

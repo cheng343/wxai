@@ -6,14 +6,11 @@ import android.os.Handler
 import java.lang.reflect.Proxy
 
 /**
- * 微信进程内收消息监听安装点。
+ * 微信进程内收消息监听安装点（纯 LibXposed API 102）。
  *
- * 双模自适应策略（彻底解决与 WeKit 的 Hook 冲突）：
- * 1. 若检测到进程内已加载 WeKit（通过 ActivityThread.mInstrumentation / mH.mCallback 拿到 WeKit ClassLoader），
- *    直接向 WeKit 的 WeDatabaseListenerApi.INSTANCE.addListener(...) 注册动态代理监听器，
- *    **安装 0 个 Xposed Hook**，与 WeKit 零冲突共享同一个数据库写入事件流！
- * 2. 仅当未开启 WeKit（WXAI 独立运行）时，才使用 LibXposed 102 API（或旧版 Xposed 回退）
- *    挂载 com.tencent.wcdb.database.SQLiteDatabase.insertWithOnConflict。
+ * 1. 优先挂接 WeKit 的 WeDatabaseListenerApi.INSTANCE.addListener，全生命周期 0 Hook；
+ * 2. 独立运行时使用 LibXposed 102 挂载 SQLiteDatabase.insertWithOnConflict；
+ * 3. 彻底不调用 de.robv.android.xposed.*。
  */
 object Hooks {
 
@@ -21,7 +18,7 @@ object Hooks {
         MessageSender.init(cl)
         ReplyEngine.start(ctx)
 
-        // 等待最多 3 秒让 WeKit 完成 ActivityProxy 初始化（如果启用了 WeKit）
+        // 等待最多 3 秒让 WeKit 完成 ActivityProxy 初始化
         var wekitCl: ClassLoader? = null
         for (i in 0 until 6) {
             wekitCl = findWeKitClassLoader()
@@ -146,28 +143,10 @@ object Hooks {
                 Int::class.javaPrimitiveType
             )
 
-            if (LxpEntry.module != null) {
-                LxpEntry.hookMethodAfter(method) { thisObj, args, result ->
-                    handleInsertCallback(thisObj, args, result)
-                }
-                L.i("hooked ${DexMap.WCDB_DATABASE}.insertWithOnConflict via LibXposed 102")
-                return
+            LxpEntry.hookMethodAfter(method) { thisObj, args, result ->
+                handleInsertCallback(thisObj, args, result)
             }
-
-            de.robv.android.xposed.XposedHelpers.findAndHookMethod(
-                dbCls,
-                "insertWithOnConflict",
-                String::class.java,
-                String::class.java,
-                ContentValues::class.java,
-                Int::class.javaPrimitiveType,
-                object : de.robv.android.xposed.XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        handleInsertCallback(param.thisObject, param.args, param.result)
-                    }
-                }
-            )
-            L.i("hooked ${DexMap.WCDB_DATABASE}.insertWithOnConflict via Legacy Xposed")
+            L.i("hooked ${DexMap.WCDB_DATABASE}.insertWithOnConflict via LibXposed 102")
         } catch (t: Throwable) {
             L.e("installStandaloneWcdbHook failed", t)
         }
