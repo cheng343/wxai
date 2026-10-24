@@ -11,8 +11,8 @@ android {
         applicationId = "dev.cheng.wxai"
         minSdk = 26
         targetSdk = 34
-        versionCode = 7
-        versionName = "1.2.4"
+        versionCode = 8
+        versionName = "1.2.5"
     }
 
     buildFeatures {
@@ -74,6 +74,7 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
+        resources.merges += "META-INF/xposed/*"
         resources.excludes += setOf(
             "META-INF/*.kotlin_module",
             "META-INF/*.version",
@@ -87,6 +88,7 @@ android {
 
 dependencies {
     compileOnly("de.robv.android.xposed:api:82")
+    compileOnly("io.github.libxposed:api:102.0.0")
 
     val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
     implementation(composeBom)

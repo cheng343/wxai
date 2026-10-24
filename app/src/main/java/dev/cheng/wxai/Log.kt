@@ -5,8 +5,8 @@ import android.util.Log as AndroidLog
 /**
  * 统一日志出口。
  *
- * 这个类会被两个进程加载：微信进程（有 XposedBridge）和模块 App 自己的进程（没有）。
- * 所以这里不能在对象初始化阶段碰 XposedBridge，改为首次写入时探测 + try/catch 兜底。
+ * 优先走 LibXposed 102 的 XposedModule.log（不触碰 Legacy XposedBridge）；
+ * 若由旧版 Xposed 加载则回退到 XposedBridge.log，模块自身进程则写 Android Logcat。
  */
 object L {
     private const val TAG = "WXAI"
@@ -16,34 +16,58 @@ object L {
     var verbose: Boolean = true
 
     @Volatile
-    private var xposed: Boolean? = null
+    private var legacyXposed: Boolean? = null
 
-    private fun hasXposed(): Boolean {
-        xposed?.let { return it }
+    private fun hasLegacyXposed(): Boolean {
+        if (LxpEntry.module != null) return false
+        legacyXposed?.let { return it }
         val ok = try {
             Class.forName("de.robv.android.xposed.XposedBridge", false, L::class.java.classLoader)
             true
         } catch (_: Throwable) {
             false
         }
-        xposed = ok
+        legacyXposed = ok
         return ok
     }
 
     private fun log(msg: String) {
-        if (hasXposed()) {
+        val lxp = try {
+            LxpEntry.module
+        } catch (_: Throwable) {
+            null
+        }
+        if (lxp != null) {
+            try {
+                lxp.log(AndroidLog.INFO, TAG, msg, null)
+                return
+            } catch (_: Throwable) {
+            }
+        }
+        if (hasLegacyXposed()) {
             try {
                 de.robv.android.xposed.XposedBridge.log(msg)
                 return
             } catch (_: Throwable) {
-                // 落到 android.util.Log
             }
         }
         AndroidLog.i(TAG, msg)
     }
 
     private fun logThrowable(t: Throwable) {
-        if (hasXposed()) {
+        val lxp = try {
+            LxpEntry.module
+        } catch (_: Throwable) {
+            null
+        }
+        if (lxp != null) {
+            try {
+                lxp.log(AndroidLog.ERROR, TAG, t.message ?: t.javaClass.simpleName, t)
+                return
+            } catch (_: Throwable) {
+            }
+        }
+        if (hasLegacyXposed()) {
             try {
                 de.robv.android.xposed.XposedBridge.log(t)
                 return

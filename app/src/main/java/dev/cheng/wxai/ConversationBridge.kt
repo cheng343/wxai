@@ -8,19 +8,17 @@ import android.content.IntentFilter
 import android.database.Cursor
 import android.net.Uri
 import android.os.Build
-import de.robv.android.xposed.XC_MethodHook
-import de.robv.android.xposed.XposedHelpers
 import java.lang.reflect.Modifier
 import kotlin.concurrent.thread
 
 /**
- * 微信进程侧的会话枚举器。
+ * 微信进程侧的会话枚举器（零 Hook 实现）。
  *
- * 完全对齐 WeKit (WeDatabaseApi) 的被动式数据库句柄获取：
- * 1. 启动期绝不启动轮询线程、绝不执行 rawQuery SQL、绝不主动调用跨进程 ContentProvider；
- * 2. 被动通过两条轻量通道记录 SQLiteDatabase 引用：
- *    a) SQLiteDatabase.insertWithOnConflict("message" | "rconversation", ...) 的 thisObject 就是 EnMicroMsg.db；
- *    b) hm0.j1.u() 的返回值 CoreStorage (hm0.b0) -> ka5.b0 -> P()；
+ * 1. 全程安装 **0 个 Xposed Hook**，绝不挂载 hm0.j1.u()，也不触碰 Legacy XposedHelpers；
+ * 2. 通过三条无 Hook 通道获取 SQLiteDatabase 实例：
+ *    a) 若开启了 WeKit，直接读取 dev.ujhhgtg.wekit.features.api.core.WeDatabaseApi.INSTANCE.db；
+ *    b) 当收到消息 / 会话写入时，从 insertWithOnConflict 的 thisObject 记录；
+ *    c) 用户点击「刷新」时，若尚未拿到 DB，直接通过标准反射读取 hm0.j1 单例字段链；
  * 3. 只有当用户在 WXAI 模块界面点击「从微信选择会话 / 刷新」发出广播时，才在后台线程执行一次查询并回推。
  */
 object ConversationBridge {
@@ -34,6 +32,9 @@ object ConversationBridge {
     @Volatile
     private var appClassLoader: ClassLoader? = null
 
+    @Volatile
+    private var wekitClassLoader: ClassLoader? = null
+
     fun install(ctx: Context, cl: ClassLoader) {
         val app = ctx.applicationContext ?: ctx
         appClassLoader = cl
@@ -43,30 +44,42 @@ object ConversationBridge {
         } catch (t: Throwable) {
             L.e("$TAG register receiver failed", t)
         }
+    }
 
-        // 对齐 WeKit WeDatabaseApi.onEnable：被动挂 hm0.j1.u()，只在微信自己调用时顺手记下 DB 引用，不做任何查询
-        try {
-            XposedHelpers.findAndHookMethod(
-                DexMap.MM_KERNEL,
-                cl,
-                DexMap.MM_KERNEL_GET_STORAGE,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        if (database != null) return
-                        val storageObj = param.result ?: return
-                        tryCaptureQuietly(storageObj)
-                    }
-                }
+    fun setWeKitClassLoader(cl: ClassLoader) {
+        wekitClassLoader = cl
+        tryCaptureFromWeKit()
+    }
+
+    fun tryCaptureFromWeKit(): Boolean {
+        if (database != null) return true
+        val wkCl = wekitClassLoader ?: return false
+        return try {
+            val apiCls = Class.forName(
+                "dev.ujhhgtg.wekit.features.api.core.WeDatabaseApi",
+                true,
+                wkCl
             )
-        } catch (t: Throwable) {
-            L.w("$TAG hook ${DexMap.MM_KERNEL}.${DexMap.MM_KERNEL_GET_STORAGE} skipped: ${t.message}")
+            val inst = apiCls.getDeclaredField("INSTANCE").apply {
+                isAccessible = true
+            }.get(null) ?: return false
+
+            val dbField = apiCls.getDeclaredField("db").apply {
+                isAccessible = true
+            }
+            val dbObj = dbField.get(inst)
+            if (dbObj != null) {
+                database = dbObj
+                L.i("$TAG database captured from WeKit WeDatabaseApi: ${dbObj.javaClass.name}")
+                true
+            } else {
+                false
+            }
+        } catch (_: Throwable) {
+            false
         }
     }
 
-    /**
-     * 当 SQLiteDatabase.insertWithOnConflict 操作 message / rconversation 表时，
-     * thisObject 本身就是 EnMicroMsg.db 的 SQLiteDatabase 实例，直接记录即可。
-     */
     fun onSqliteDatabaseSeen(dbObj: Any) {
         if (database == null) {
             database = dbObj
@@ -78,6 +91,7 @@ object ConversationBridge {
 
     private fun tryCaptureFromKernel(cl: ClassLoader? = appClassLoader): Boolean {
         if (database != null) return true
+        if (tryCaptureFromWeKit()) return true
         val loader = cl ?: return false
         val coreStorage = getCoreStorageQuietly(loader) ?: return false
         tryCaptureQuietly(coreStorage)
@@ -86,7 +100,7 @@ object ConversationBridge {
 
     private fun getCoreStorageQuietly(cl: ClassLoader): Any? {
         return try {
-            val kernelCls = XposedHelpers.findClass(DexMap.MM_KERNEL, cl)
+            val kernelCls = Class.forName(DexMap.MM_KERNEL, false, cl)
             val kernelInst = kernelCls.declaredFields.firstNotNullOfOrNull { f ->
                 if (!Modifier.isStatic(f.modifiers) || f.type != kernelCls) return@firstNotNullOfOrNull null
                 try {
@@ -319,6 +333,3 @@ object ConversationBridge {
         L.i("$TAG refresh receiver registered for ${ConversationProtocol.ACTION_LIST_CONVERSATIONS}")
     }
 }
-
-
-

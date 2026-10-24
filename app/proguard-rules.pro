@@ -10,6 +10,7 @@
 
 # Xposed API 是 compileOnly，运行时由框架提供
 -dontwarn de.robv.android.xposed.**
+-dontwarn io.github.libxposed.api.**
 -dontwarn org.xmlpull.v1.**
 -dontwarn org.slf4j.**
 

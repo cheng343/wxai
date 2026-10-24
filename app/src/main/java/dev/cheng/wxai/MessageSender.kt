@@ -2,7 +2,6 @@ package dev.cheng.wxai
 
 import android.os.Handler
 import android.os.Looper
-import de.robv.android.xposed.XposedHelpers
 import java.lang.reflect.Constructor
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -17,7 +16,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *     -> queue.g(scene) 投递
  *
  * 启动期只保存 ClassLoader，不做任何类加载或反射扫描；
- * 仅在首次需要发送回复时在主线程按需解析一次，避免拖慢或干扰微信启动。
+ * 全程使用标准 Class.forName，绝不依赖 Legacy XposedHelpers。
  */
 object MessageSender {
 
@@ -50,7 +49,7 @@ object MessageSender {
         if (resolved) return true
         val cl = appClassLoader ?: return false
         return try {
-            val sCls = XposedHelpers.findClass(DexMap.SEND_SCENE, cl)
+            val sCls = Class.forName(DexMap.SEND_SCENE, false, cl)
             val ctor5 = sCls.declaredConstructors.firstOrNull { c ->
                 val p = c.parameterTypes
                 p.size == 5 &&
@@ -71,14 +70,14 @@ object MessageSender {
             sceneCtor = ctor
             ctorArgCount = ctor.parameterCount
 
-            val getterCls = XposedHelpers.findClass(DexMap.QUEUE_GETTER, cl)
+            val getterCls = Class.forName(DexMap.QUEUE_GETTER, false, cl)
             val getter = getterCls.declaredMethods.firstOrNull { m ->
                 m.name == DexMap.QUEUE_GETTER_METHOD && m.parameterTypes.isEmpty() && Modifier.isStatic(m.modifiers)
             } ?: throw IllegalStateException("queue getter not found in ${getterCls.name}")
             getter.isAccessible = true
             queueGetter = getter
 
-            val queueCls = XposedHelpers.findClass(DexMap.QUEUE, cl)
+            val queueCls = Class.forName(DexMap.QUEUE, false, cl)
             val post = queueCls.declaredMethods.firstOrNull { m ->
                 m.name == DexMap.QUEUE_POST_METHOD &&
                     m.parameterTypes.size == 1 &&
@@ -141,5 +140,3 @@ object MessageSender {
         }
     }
 }
-
-
