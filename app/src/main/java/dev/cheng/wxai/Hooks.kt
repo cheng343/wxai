@@ -12,11 +12,12 @@ object Hooks {
         MessageSender.init(cl)
         ReplyEngine.start(ctx)
 
-        var installed = 0
-
-        installed += hookInsert(cl, DexMap.MSG_INSERT_NAME, singleArg = true)
-        // API 插入路径（部分同步/系统消息走这里），dedupe 由引擎按 msgId 负责
-        installed += hookInsert(cl, DexMap.MSG_API_INSERT_NAME, singleArg = false)
+        // 8.0.76 中 f9.H9(e9) 只是 this.I9(e9, false) 的单行包装；
+        // 优先只挂底层 I9(e9, boolean)，避免每次插入触发两次 hook。
+        var installed = hookInsert(ctx, cl, DexMap.MSG_API_INSERT_NAME, singleArg = false)
+        if (installed == 0) {
+            installed += hookInsert(ctx, cl, DexMap.MSG_INSERT_NAME, singleArg = true)
+        }
 
         if (installed == 0) {
             L.e("no receive hook installed — 收消息不会触发，请检查微信版本/映射表")
@@ -25,7 +26,7 @@ object Hooks {
         }
     }
 
-    private fun hookInsert(cl: ClassLoader, name: String, singleArg: Boolean): Int {
+    private fun hookInsert(ctx: Context, cl: ClassLoader, name: String, singleArg: Boolean): Int {
         return try {
             val storage = XposedHelpers.findClass(DexMap.MSG_INFO_STORAGE, cl)
             val msgInfoClass = XposedHelpers.findClass(DexMap.MSG_INFO, cl)
@@ -50,6 +51,11 @@ object Hooks {
 
             XposedBridge.hookMethod(target, object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    // 顺带把 f9 实例交给 ConversationBridge（f9.r 同样持有 s85.k0 / ka5.b0 数据库包装器）
+                    param.thisObject?.let { ConversationBridge.onStorageSeen(ctx, it) }
+
+                    val rowId = param.result as? Long ?: -1L
+                    if (rowId < 0L) return
                     val msg = param.args.getOrNull(0) ?: return
                     try {
                         ReplyEngine.onMessageInserted(msg)

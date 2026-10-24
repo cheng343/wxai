@@ -5,24 +5,36 @@ import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
 import java.lang.reflect.Field
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.Executors
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 /**
  * 收到消息 -> 过滤 -> 调模型 -> 发送。
  *
  * 过滤链（任何一步不通过就静默返回）：
- *   开关 / 文本消息 / 不是自己发的 / 时间够新 / 白名单 / 群聊@ / 频率限制 / 去重
+ *   开关 / 文本消息 / 不是自己发的 / 时间够新（毫秒对齐） / 白名单 / 群聊@ / 频率限制 / 去重
  */
 object ReplyEngine {
 
     private const val STALE_MSG_SECONDS = 120L
     private const val SEEN_CACHE = 512
 
-    private val pool = Executors.newFixedThreadPool(2) { r ->
-        Thread(r, "wxai-reply").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 }
-    }
+    /**
+     * 单工作线程 + 有界队列（最多排 8 条，超出丢弃最旧）：
+     * 保证 AI 请求与发消息串行执行，绝不并发冲击微信数据库或 NetSceneQueue。
+     */
+    private val pool = ThreadPoolExecutor(
+        1,
+        1,
+        0L,
+        TimeUnit.MILLISECONDS,
+        ArrayBlockingQueue(8),
+        { r -> Thread(r, "wxai-reply").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 } },
+        ThreadPoolExecutor.DiscardOldestPolicy(),
+    )
 
     private class TalkerState {
         @Volatile
@@ -33,8 +45,7 @@ object ReplyEngine {
     private val states = ConcurrentHashMap<String, TalkerState>()
 
     /**
-     * 去重键：insertMessage 与 apiInsert 两条 hook 可能对同一条消息各触发一次，
-     * 且字段在写库瞬间未必齐全，所以用 svrId/msgId + 会话 + 时间 + 内容哈希 组复合键。
+     * 去重键：用 svrId/msgId + 会话 + 时间 + 内容哈希 组复合键。
      */
     private val seenKeys = object : LinkedHashMap<String, Boolean>(SEEN_CACHE, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Boolean>): Boolean =
@@ -55,89 +66,111 @@ object ReplyEngine {
 
     // ---------------------------------------------------------------- hook 入口
 
+    /**
+     * 注意：此方法运行在微信 f9.I9 数据库插入线程上（可能持有微信同步锁）！
+     * 必须在微秒级内完成基础字段读取并返回，严禁在此线程上做任何跨进程查询、网络或阻塞操作。
+     */
     fun onMessageInserted(msg: Any) {
         val ctx = appCtx ?: return
-        val cfg = ConfigBridge.get(ctx)
-        if (!cfg.enabled) return
 
         if ((intField(msg, DexMap.F_TYPE) ?: return) != DexMap.TYPE_TEXT) return
         if ((intField(msg, DexMap.F_IS_SEND) ?: return) != 0) return // 自己发的，别自问自答
 
+        val createTime = longField(msg, DexMap.F_CREATE_TIME) ?: 0L
+        val nowMs = System.currentTimeMillis()
+        // 微信 e9.field_createTime 单位是毫秒（如 1760000000000L），兼容秒级时间戳
+        val msgTimeMs = when {
+            createTime <= 0L -> 0L
+            createTime < 10_000_000_000L -> createTime * 1000L
+            else -> createTime
+        }
+        if (msgTimeMs <= 0L || nowMs - msgTimeMs > STALE_MSG_SECONDS * 1000L) {
+            return
+        }
+
         val talker = strField(msg, DexMap.F_TALKER).orEmpty().trim()
         if (talker.isEmpty()) return
 
-        val isGroup = talker.endsWith("@chatroom")
-        var content = strField(msg, DexMap.F_CONTENT).orEmpty()
-        if (isGroup) content = stripGroupSenderPrefix(content)
-        content = content.trim()
-        if (content.isEmpty()) return
+        // ConfigBridge.get 现已改为纯内存读取（永不阻塞），提前过滤非白名单会话避免无意义入队
+        val cfg = ConfigBridge.get(ctx)
+        if (!cfg.enabled) return
+        if (!inWhitelist(cfg.whitelist, talker)) return
+
+        val rawContent = strField(msg, DexMap.F_CONTENT).orEmpty()
+        if (rawContent.isEmpty()) return
 
         val msgId = longField(msg, DexMap.F_MSG_ID) ?: 0L
         val svrId = longField(msg, DexMap.F_SVR_ID) ?: 0L
-        val createTime = longField(msg, DexMap.F_CREATE_TIME) ?: 0L
 
-        val dedupeKey = when {
-            svrId != 0L -> "s$svrId"
-            msgId != 0L -> "m$msgId"
-            else -> "h$talker|$createTime|${content.hashCode()}"
+        pool.execute {
+            processCandidate(cfg, talker, rawContent, msgId, svrId, msgTimeMs)
         }
-        if (!markSeen(dedupeKey)) {
-            L.i("duplicate msg ignored ($dedupeKey)")
-            return
-        }
-
-        val nowSec = System.currentTimeMillis() / 1000
-        if (createTime > 0 && nowSec - createTime > STALE_MSG_SECONDS) {
-            L.i("skip stale msg from $talker (${nowSec - createTime}s old)")
-            return
-        }
-
-        if (!inWhitelist(cfg.whitelist, talker)) return
-        if (isGroup && cfg.groupOnlyWhenMentioned && !mentionsMe(content, cfg)) {
-            L.i("group msg skipped (not mentioned): ${content.take(40)}")
-            return
-        }
-        if (looksLikeSystemOrMedia(content)) return
-        if (!passRateLimit(cfg, talker)) return
-
-        L.i("trigger <- $talker: ${content.take(60)}")
-        dispatch(cfg, talker, content, isGroup)
     }
 
-    // ---------------------------------------------------------------- 发送流程
+    // ---------------------------------------------------------------- 后台过滤与发送流程
 
-    private fun dispatch(cfg: Config, talker: String, content: String, isGroup: Boolean) {
-        pool.execute {
-            try {
-                val delay = if (cfg.replyDelayMaxMs > cfg.replyDelayMinMs) {
-                    Random.nextLong(cfg.replyDelayMinMs.toLong(), cfg.replyDelayMaxMs.toLong() + 1)
-                } else {
-                    cfg.replyDelayMinMs.toLong()
-                }
-                if (delay > 0) Thread.sleep(delay)
+    private fun processCandidate(
+        cfg: Config,
+        talker: String,
+        rawContent: String,
+        msgId: Long,
+        svrId: Long,
+        msgTimeMs: Long,
+    ) {
+        try {
+            val isGroup = talker.endsWith("@chatroom")
+            var content = if (isGroup) stripGroupSenderPrefix(rawContent) else rawContent
+            content = content.trim()
+            if (content.isEmpty()) return
 
-                val extra = if (isGroup) "当前是微信群聊，回复要更口语、更短。" else null
-                val result = AiClient.complete(cfg, content, extra)
-                val text = result.text
-                if (text.isNullOrBlank()) {
-                    debugToast(cfg, "回复失败: ${result.error ?: "unknown"}")
-                    L.w("no reply for $talker: ${result.error}")
-                    return@execute
-                }
-
-                val reply = sanitize(text, cfg.maxReplyChars)
-                if (reply.isEmpty()) {
-                    L.w("sanitized reply empty for $talker")
-                    return@execute
-                }
-
-                val ok = MessageSender.sendText(talker, reply)
-                recordReply(talker)
-                debugToast(cfg, if (ok) "已回复: ${reply.take(30)}" else "发送失败")
-                L.i("reply -> $talker: ${reply.take(60)} (ok=$ok)")
-            } catch (t: Throwable) {
-                L.e("dispatch failed for $talker", t)
+            if (looksLikeSystemOrMedia(content)) return
+            if (isGroup && cfg.groupOnlyWhenMentioned && !mentionsMe(content, cfg)) {
+                L.i("group msg skipped (not mentioned): ${content.take(40)}")
+                return
             }
+
+            val dedupeKey = when {
+                svrId != 0L -> "s$svrId"
+                msgId != 0L -> "m$msgId"
+                else -> "h$talker|$msgTimeMs|${content.hashCode()}"
+            }
+            if (!markSeen(dedupeKey)) {
+                L.i("duplicate msg ignored ($dedupeKey)")
+                return
+            }
+
+            if (!passRateLimit(cfg, talker)) return
+
+            L.i("trigger <- $talker: ${content.take(60)}")
+
+            val delay = if (cfg.replyDelayMaxMs > cfg.replyDelayMinMs) {
+                Random.nextLong(cfg.replyDelayMinMs.toLong(), cfg.replyDelayMaxMs.toLong() + 1)
+            } else {
+                cfg.replyDelayMinMs.toLong()
+            }
+            if (delay > 0) Thread.sleep(delay)
+
+            val extra = if (isGroup) "当前是微信群聊，回复要更口语、更短。" else null
+            val result = AiClient.complete(cfg, content, extra)
+            val text = result.text
+            if (text.isNullOrBlank()) {
+                debugToast(cfg, "回复失败: ${result.error ?: "unknown"}")
+                L.w("no reply for $talker: ${result.error}")
+                return
+            }
+
+            val reply = sanitize(text, cfg.maxReplyChars)
+            if (reply.isEmpty()) {
+                L.w("sanitized reply empty for $talker")
+                return
+            }
+
+            val ok = MessageSender.sendText(talker, reply)
+            recordReply(talker)
+            debugToast(cfg, if (ok) "已回复: ${reply.take(30)}" else "发送失败")
+            L.i("reply -> $talker: ${reply.take(60)} (ok=$ok)")
+        } catch (t: Throwable) {
+            L.e("processCandidate failed for $talker", t)
         }
     }
 

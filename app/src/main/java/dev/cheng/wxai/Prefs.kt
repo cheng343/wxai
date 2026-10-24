@@ -1,6 +1,7 @@
 package dev.cheng.wxai
 
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 
 /**
@@ -34,7 +35,15 @@ object Prefs {
     /** 写配置。写失败时向上抛，由调用方（SettingsActivity）提示用户。 */
     fun save(ctx: Context, cfg: Config) {
         val json = cfg.toJson().toString()
-        prefs(ctx).edit().putString(KEY_CONFIG_JSON, json).apply()
+        prefs(ctx).edit().putString(KEY_CONFIG_JSON, json).commit()
+        try {
+            val intent = Intent(ConversationProtocol.ACTION_CONFIG_UPDATED)
+                .setPackage(ConversationProtocol.WECHAT_PACKAGE)
+                .putExtra(ConversationProtocol.EXTRA_CONFIG_JSON, json)
+                .addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+            ctx.sendBroadcast(intent)
+        } catch (_: Throwable) {
+        }
     }
 
     /** 读微信进程推上来的会话列表快照；从未推送过返回 EMPTY。 */

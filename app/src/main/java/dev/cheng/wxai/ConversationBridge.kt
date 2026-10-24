@@ -9,7 +9,6 @@ import android.database.Cursor
 import android.net.Uri
 import android.os.Build
 import android.os.SystemClock
-import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
 import java.lang.reflect.Modifier
 import kotlin.concurrent.thread
@@ -17,168 +16,196 @@ import kotlin.concurrent.thread
 /**
  * 微信进程侧的会话枚举器。
  *
- * 为什么必须跑在微信进程里：会话表 EnMicroMsg.db 是 wcdb 加密库，
- * 明文句柄只有微信自己手里有。WeKit 的做法是拦 MMKernel.getStorage() 拿到 CoreStorage，
- * 再从中取出 SqliteDBWrapper 上返回 SQLiteDatabase 的方法 —— 这里照抄同一套反射路径
- * （8.0.76 的混淆名来自 WeKit 的 Dex-Test 报告，见 DexMap）。
- *
- * 拿到句柄后执行一条 JOIN 查询，把结果 JSON 通过 ConfigProvider 推给模块 App，
- * App 侧只负责展示和勾选，从不接触微信数据。
+ * 8.0.76 (3141) 逆向验证结构：
+ * - MMKernel (hm0.j1) 静态字段 m 持有 hm0.j1 单例，其实例字段 d 持有 CoreStorage (hm0.b0)
+ *   （直接反射读字段可避免调 hm0.j1.u() 在未登录/早期阶段触发 Lp06/a; 断言异常）
+ * - CoreStorage (hm0.b0) 的字段 `public s85.k0 f` 以及 MsgInfoStorage (com.tencent.mm.storage.f9)
+ *   的字段 `public final s85.k0 r`，其声明类型为接口 `s85.k0`，运行时类型均为 `ka5.b0` (SqliteDBWrapper)
+ * - `ka5.b0.P()`（内部调用 `this.b.e()`）返回 `com.tencent.wcdb.database.SQLiteDatabase`
  */
 object ConversationBridge {
 
     private const val TAG = "WXAI/Conv"
+    private const val SQLITE_INTERFACE = "s85.k0"
 
-    /** 等待微信内核初始化的轮询：40 次 × 3s = 2 分钟 */
-    private const val WAIT_TRIES = 40
+    /** 等待微信内核初始化的轮询：60 次 × 3s = 3 分钟 */
+    private const val WAIT_TRIES = 60
     private const val WAIT_INTERVAL_MS = 3_000L
 
     @Volatile
     private var database: Any? = null
 
     @Volatile
-    private var storage: Any? = null
+    private var appClassLoader: ClassLoader? = null
 
     fun install(ctx: Context, cl: ClassLoader) {
-        // 注意：这里【不】hook MMKernel.u()。
-        // u() 是微信启动期间被高频调用的内核 getter，挂全局 after-hook 属于高风险改动；
-        // 反正拿句柄只需要一次，用后台轮询即可（最多晚 3 秒）。
+        val app = ctx.applicationContext ?: ctx
+        appClassLoader = cl
 
         try {
-            registerRefreshReceiver(ctx)
+            registerRefreshReceiver(app)
         } catch (t: Throwable) {
             L.e("$TAG register receiver failed", t)
         }
 
-        // 启动时 MMKernel 往往还没初始化完，后台轮询到拿到句柄为止
         thread(name = "wxai-conv-init", isDaemon = true) {
-            awaitKernel(ctx, cl)
+            awaitKernel(app, cl)
+        }
+    }
+
+    /**
+     * 当 Hooks 拦截到 f9.I9 插入消息时调用：f9.r 同样持有 ka5.b0 数据库包装器，可作为双保险捕获通道。
+     */
+    fun onStorageSeen(ctx: Context, storageObj: Any) {
+        if (database != null) return
+        val app = ctx.applicationContext ?: ctx
+        thread(name = "wxai-conv-capture", isDaemon = true) {
+            tryCapture(app, storageObj)
         }
     }
 
     // ---------------- 取 DB 句柄 ----------------
 
-    /** 主动轮询 mmkernel.u()，直到返回非 null（微信启动早期会抛"未初始化"）。 */
     private fun awaitKernel(ctx: Context, cl: ClassLoader) {
         for (i in 1..WAIT_TRIES) {
             if (database != null) {
-                // 句柄已就绪：补一次推送，让 App 打开时就有数据
                 pushSnapshot(ctx)
                 return
             }
-            val obj = try {
-                val kernel = XposedHelpers.findClass(DexMap.MM_KERNEL, cl)
-                XposedHelpers.callStaticMethod(kernel, DexMap.MM_KERNEL_GET_STORAGE)
-            } catch (t: Throwable) {
-                null
-            }
-            if (obj != null) {
-                tryCapture(ctx, obj)
-                if (database != null) return
+            if (tryCaptureFromKernel(ctx, cl)) {
+                return
             }
             SystemClock.sleep(WAIT_INTERVAL_MS)
         }
-        L.w("$TAG kernel not ready after ${WAIT_TRIES * WAIT_INTERVAL_MS / 1000}s, conversation list unavailable")
+        L.w("$TAG kernel not ready after ${WAIT_TRIES * WAIT_INTERVAL_MS / 1000}s")
+    }
+
+    private fun tryCaptureFromKernel(ctx: Context, cl: ClassLoader? = appClassLoader): Boolean {
+        if (database != null) return true
+        val loader = cl ?: return false
+        val coreStorage = getCoreStorageQuietly(loader) ?: return false
+        tryCapture(ctx, coreStorage)
+        return database != null
+    }
+
+    /**
+     * 静默通过静态字段读取 hm0.j1.m -> d (hm0.b0)，不调用会抛 AssertionFailedError 的 hm0.j1.u()。
+     */
+    private fun getCoreStorageQuietly(cl: ClassLoader): Any? {
+        return try {
+            val kernelCls = XposedHelpers.findClass(DexMap.MM_KERNEL, cl)
+            // 1) 找 hm0.j1 自身类型的静态单例字段（8.0.76 为 m）
+            val kernelInst = kernelCls.declaredFields.firstNotNullOfOrNull { f ->
+                if (!Modifier.isStatic(f.modifiers) || f.type != kernelCls) return@firstNotNullOfOrNull null
+                try {
+                    f.isAccessible = true
+                    f.get(null)
+                } catch (_: Throwable) {
+                    null
+                }
+            } ?: return null
+
+            // 2) 在 hm0.j1 实例上找 hm0.b0 (CoreStorage) 字段（8.0.76 为 d）
+            for (f in kernelCls.declaredFields) {
+                if (Modifier.isStatic(f.modifiers)) continue
+                if (f.name == "d" || f.type.name == "hm0.b0") {
+                    f.isAccessible = true
+                    val v = f.get(kernelInst)
+                    if (v != null) return v
+                }
+            }
+            null
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     private fun tryCapture(ctx: Context, storageObj: Any) {
         if (database != null) return
+        var capturedNow = false
         synchronized(this) {
-            if (database != null) return
-            storage = storageObj
-            val handle = findDatabaseHandle(storageObj)
-            if (handle == null) {
-                L.w("$TAG no SQLiteDatabase handle found in ${storageObj.javaClass.name}")
-                return
+            if (database == null) {
+                val handle = findDatabaseHandle(storageObj)
+                if (handle != null) {
+                    database = handle
+                    capturedNow = true
+                    L.i("$TAG database ready: ${handle.javaClass.name}")
+                }
             }
-            database = handle
-            L.i("$TAG database ready: ${handle.javaClass.name}")
         }
-        // 首次拿到句柄，主动推一次（用户可能压根没点过刷新）
-        pushSnapshot(ctx)
+        if (capturedNow) {
+            pushSnapshot(ctx)
+        }
     }
 
     /**
-     * 从 CoreStorage 里挖 wcdb 句柄。
-     *
-     * 先按 WeKit 的路径：找类型为 SqliteDBWrapper 的字段，再调它上面"无参 + 返回 SQLiteDatabase"的方法。
-     * 找不到就直接扫所有字段（不依赖混淆名），最后再试试 storage 自己。
+     * 从 CoreStorage (hm0.b0) 或 MsgInfoStorage (f9) 里提取 SQLiteDatabase：
+     * 检查运行时类型为 ka5.b0 或声明类型为 s85.k0 的字段，再调用其返回 SQLiteDatabase 的无参方法 P()。
      */
     private fun findDatabaseHandle(storageObj: Any): Any? {
-        // 1) 优先：声明类型名等于 ka5.b0 的字段
-        run {
-            var cls: Class<*>? = storageObj.javaClass
-            while (true) {
-                val c = cls ?: break
-                if (c == Any::class.java) break
-                for (f in c.declaredFields) {
-                    if (Modifier.isStatic(f.modifiers)) continue
-                    val typeName = f.type.name
-                    if (typeName != DexMap.SQLITE_WRAPPER) continue
-                    val value = try {
-                        f.isAccessible = true
-                        f.get(storageObj)
-                    } catch (t: Throwable) {
-                        null
-                    } ?: continue
+        if (storageObj.javaClass.name == DexMap.SQLITE_WRAPPER) {
+            callDatabaseAccessor(storageObj)?.let { return it }
+        }
+
+        var cls: Class<*>? = storageObj.javaClass
+        while (cls != null && cls != Any::class.java) {
+            for (f in cls.declaredFields) {
+                if (Modifier.isStatic(f.modifiers)) continue
+                val value = try {
+                    f.isAccessible = true
+                    f.get(storageObj)
+                } catch (_: Throwable) {
+                    null
+                } ?: continue
+
+                val runtimeName = value.javaClass.name
+                val declaredName = f.type.name
+                if (runtimeName.contains("SQLiteDatabase")) {
+                    L.i("$TAG direct SQLiteDatabase field ${cls.name}#${f.name}")
+                    return value
+                }
+                if (runtimeName == DexMap.SQLITE_WRAPPER ||
+                    declaredName == DexMap.SQLITE_WRAPPER ||
+                    declaredName == SQLITE_INTERFACE
+                ) {
                     callDatabaseAccessor(value)?.let {
-                        L.i("$TAG db handle via field ${c.name}#${f.name}")
+                        L.i("$TAG db handle via ${cls.name}#${f.name} (declared=$declaredName, runtime=$runtimeName)")
                         return it
                     }
                 }
-                cls = c.superclass
             }
+            cls = cls.superclass
         }
-
-        // 2) 兜底：扫所有字段，谁身上有无参返回 SQLiteDatabase 的方法就用谁
-        run {
-            var cls: Class<*>? = storageObj.javaClass
-            while (true) {
-                val c = cls ?: break
-                if (c == Any::class.java) break
-                for (f in c.declaredFields) {
-                    if (Modifier.isStatic(f.modifiers)) continue
-                    val value = try {
-                        f.isAccessible = true
-                        f.get(storageObj)
-                    } catch (t: Throwable) {
-                        null
-                    } ?: continue
-                    callDatabaseAccessor(value)?.let {
-                        L.i("$TAG db handle via scanned field ${c.name}#${f.name} (${value.javaClass.name})")
-                        return it
-                    }
-                }
-                cls = c.superclass
-            }
-        }
-
-        // 3) storage 自己就带访问器
-        return callDatabaseAccessor(storageObj)
+        return null
     }
 
-    /** 在 owner 的类层级里找 无参 且 返回类型含 "SQLiteDatabase" 的方法并调用。 */
-    private fun callDatabaseAccessor(owner: Any): Any? {
-        var cls: Class<*>? = owner.javaClass
-        while (true) {
-            val c = cls ?: break
-            if (c == Any::class.java) break
-            for (m in c.declaredMethods) {
+    /** 在 ka5.b0 的类层级里找 无参 且 返回类型含 "SQLiteDatabase" 的方法并调用。 */
+    private fun callDatabaseAccessor(wrapper: Any): Any? {
+        // 先检查 ka5.b0.b (底层 ka5.f) 是否已初始化，避免在未打开时调用 P() 触发 NPE
+        try {
+            val bField = wrapper.javaClass.getDeclaredField("b")
+            bField.isAccessible = true
+            if (bField.get(wrapper) == null) return null
+        } catch (_: Throwable) {
+        }
+
+        var cls: Class<*>? = wrapper.javaClass
+        while (cls != null && cls != Any::class.java) {
+            for (m in cls.declaredMethods) {
                 if (Modifier.isStatic(m.modifiers)) continue
                 if (m.parameterCount != 0) continue
                 if (!m.returnType.name.contains("SQLiteDatabase")) continue
                 try {
                     m.isAccessible = true
-                    val r = m.invoke(owner)
+                    val r = m.invoke(wrapper)
                     if (r != null) {
-                        L.i("$TAG accessor ${c.name}#${m.name}(): ${m.returnType.name}")
+                        L.i("$TAG accessor ${cls.name}#${m.name}(): ${m.returnType.name}")
                         return r
                     }
-                } catch (t: Throwable) {
-                    L.w("$TAG accessor ${c.name}#${m.name} threw: ${t.javaClass.simpleName}: ${t.message}")
+                } catch (_: Throwable) {
                 }
             }
-            cls = c.superclass
+            cls = cls.superclass
         }
         return null
     }
@@ -296,6 +323,9 @@ object ConversationBridge {
                 L.i("$TAG refresh requested")
                 thread(name = "wxai-conv-query", isDaemon = true) {
                     try {
+                        if (database == null) {
+                            tryCaptureFromKernel(ctx)
+                        }
                         pushSnapshot(ctx)
                     } catch (t: Throwable) {
                         L.e("$TAG refresh failed", t)
