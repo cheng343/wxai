@@ -6,37 +6,24 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.Uri
 import android.os.Build
-import android.os.SystemClock
-import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * 微信进程侧读取配置：
- * 1. 本地镜像缓存（微信自身 SharedPreferences("wxai_mirror_config")）+ 内存缓存，确保 get() 永不阻塞调用线程；
- * 2. 监听模块 App 保存配置时发出的广播 ACTION_CONFIG_UPDATED，秒级同步；
- * 3. 后台单线程异步通过 ContentProvider 拉取最新配置，彻底杜绝在微信数据库锁或主线程上跨进程卡死。
+ * 1. 启动期只加载微信自身 SharedPreferences("wxai_mirror_config") 与注册 ACTION_CONFIG_UPDATED 广播；
+ * 2. 启动期绝不主动发起跨进程 ContentProvider 查询，彻底消除启动期 Binder / AMS 锁竞争；
+ * 3. 仅当首次收到新消息且本地无镜像时，才在后台工作线程按需拉取一次 ContentProvider。
  */
 object ConfigBridge {
     private const val AUTHORITY = "dev.cheng.wxai.config"
     private const val MIRROR_PREFS = "wxai_mirror_config"
     private const val KEY_JSON = "config_json"
-    private const val TTL_MS = 15_000L
 
     @Volatile
     private var cached: Config? = null
 
-    @Volatile
-    private var cachedAt: Long = 0L
-
-    @Volatile
-    private var lastError: String? = null
-
     private val initialized = AtomicBoolean(false)
-    private val refreshing = AtomicBoolean(false)
-
-    private val bgExecutor = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "wxai-cfg").apply { isDaemon = true }
-    }
+    private val providerTriedOnce = AtomicBoolean(false)
 
     fun init(ctx: Context) {
         val app = ctx.applicationContext ?: ctx
@@ -44,53 +31,52 @@ object ConfigBridge {
             loadMirror(app)?.let {
                 cached = it
                 L.verbose = it.debug
+                L.i("config loaded from mirror: enabled=${it.enabled} whitelist=${it.whitelist.size}")
             }
             registerUpdateReceiver(app)
         }
-        refreshAsync(app)
+    }
+
+    fun hasLoadedConfig(): Boolean = cached != null
+
+    /**
+     * 纯内存读取：永不阻塞，永不触发跨进程调用。
+     */
+    fun get(ctx: Context): Config {
+        cached?.let { return it }
+        val app = ctx.applicationContext ?: ctx
+        val m = loadMirror(app)
+        if (m != null) {
+            cached = m
+            return m
+        }
+        return Config.DEFAULT
     }
 
     /**
-     * 非阻塞获取配置：永远立即返回内存缓存或本地镜像，过期时仅触发后台异步刷新。
+     * 仅在 ReplyEngine 后台工作线程上调用：若本地已有镜像直接返回；
+     * 若从未同步过，则尝试向模块 ContentProvider 查询一次并落盘到微信本地镜像。
      */
-    fun get(ctx: Context, force: Boolean = false): Config {
+    fun ensureLoadedOnWorker(ctx: Context): Config {
+        cached?.let { return it }
         val app = ctx.applicationContext ?: ctx
-        var c = cached
-        if (c == null) {
-            c = loadMirror(app) ?: Config.DEFAULT
-            cached = c
+        loadMirror(app)?.let {
+            cached = it
+            return it
         }
-        val now = SystemClock.elapsedRealtime()
-        if (force || now - cachedAt >= TTL_MS) {
-            refreshAsync(app)
-        }
-        return c
-    }
-
-    fun invalidate() {
-        cachedAt = 0L
-    }
-
-    private fun refreshAsync(app: Context) {
-        if (!refreshing.compareAndSet(false, true)) return
-        bgExecutor.execute {
-            try {
-                val raw = queryProviderRaw(app)
-                if (!raw.isNullOrBlank()) {
-                    val fresh = Config.fromJson(raw)
-                    cached = fresh
-                    cachedAt = SystemClock.elapsedRealtime()
-                    L.verbose = fresh.debug
-                    saveMirror(app, raw)
-                } else {
-                    cachedAt = SystemClock.elapsedRealtime()
-                }
-            } catch (t: Throwable) {
-                L.e("refreshAsync unexpected error", t)
-            } finally {
-                refreshing.set(false)
+        if (providerTriedOnce.compareAndSet(false, true)) {
+            val raw = queryProviderRaw(app)
+            if (!raw.isNullOrBlank()) {
+                val fresh = Config.fromJson(raw)
+                cached = fresh
+                L.verbose = fresh.debug
+                saveMirror(app, raw)
+                return fresh
             }
         }
+        val def = Config.DEFAULT
+        cached = def
+        return def
     }
 
     private fun queryProviderRaw(ctx: Context): String? {
@@ -103,11 +89,7 @@ object ConfigBridge {
                     } else null
                 }
         } catch (t: Throwable) {
-            val msg = t.toString()
-            if (msg != lastError) {
-                lastError = msg
-                L.e("config provider query failed (module app installed or background restricted?)", t)
-            }
+            L.w("config provider query skipped: ${t.message}")
             null
         }
     }
@@ -138,12 +120,9 @@ object ConfigBridge {
                     if (!raw.isNullOrBlank()) {
                         val fresh = Config.fromJson(raw)
                         cached = fresh
-                        cachedAt = SystemClock.elapsedRealtime()
                         L.verbose = fresh.debug
                         saveMirror(app, raw)
                         L.i("config updated via broadcast: enabled=${fresh.enabled} whitelist=${fresh.whitelist.size}")
-                    } else {
-                        refreshAsync(app)
                     }
                 }
             }

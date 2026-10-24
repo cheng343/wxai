@@ -1,10 +1,10 @@
 package dev.cheng.wxai
 
+import android.content.ContentValues
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.widget.Toast
-import java.lang.reflect.Field
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ThreadPoolExecutor
@@ -52,8 +52,6 @@ object ReplyEngine {
             size > SEEN_CACHE
     }
 
-    private val fieldCache = ConcurrentHashMap<String, Field?>()
-
     @Volatile
     private var appCtx: Context? = null
 
@@ -67,42 +65,48 @@ object ReplyEngine {
     // ---------------------------------------------------------------- hook 入口
 
     /**
-     * 注意：此方法运行在微信 f9.I9 数据库插入线程上（可能持有微信同步锁）！
-     * 必须在微秒级内完成基础字段读取并返回，严禁在此线程上做任何跨进程查询、网络或阻塞操作。
+     * SQLiteDatabase.insertWithOnConflict("message", ..., values, ...) 回调入口。
+     * 直接读取 ContentValues，零反射、零阻塞。
      */
-    fun onMessageInserted(msg: Any) {
+    fun onMessageInsertedValues(values: ContentValues) {
         val ctx = appCtx ?: return
 
-        if ((intField(msg, DexMap.F_TYPE) ?: return) != DexMap.TYPE_TEXT) return
-        if ((intField(msg, DexMap.F_IS_SEND) ?: return) != 0) return // 自己发的，别自问自答
+        val type = values.getAsInteger("type") ?: return
+        if (type != DexMap.TYPE_TEXT) return
 
-        val createTime = longField(msg, DexMap.F_CREATE_TIME) ?: 0L
+        val isSend = values.getAsInteger("isSend") ?: 0
+        if (isSend != 0) return // 自己发的，别自问自答
+
+        val createTime = values.getAsLong("createTime") ?: 0L
         val nowMs = System.currentTimeMillis()
-        // 微信 e9.field_createTime 单位是毫秒（如 1760000000000L），兼容秒级时间戳
+        // 微信 message 表 createTime 单位是毫秒（如 1760000000000L），兼容秒级时间戳
         val msgTimeMs = when {
-            createTime <= 0L -> 0L
+            createTime <= 0L -> nowMs
             createTime < 10_000_000_000L -> createTime * 1000L
             else -> createTime
         }
-        if (msgTimeMs <= 0L || nowMs - msgTimeMs > STALE_MSG_SECONDS * 1000L) {
+        if (nowMs - msgTimeMs > STALE_MSG_SECONDS * 1000L) {
             return
         }
 
-        val talker = strField(msg, DexMap.F_TALKER).orEmpty().trim()
+        val talker = values.getAsString("talker")?.trim().orEmpty()
         if (talker.isEmpty()) return
 
-        // ConfigBridge.get 现已改为纯内存读取（永不阻塞），提前过滤非白名单会话避免无意义入队
-        val cfg = ConfigBridge.get(ctx)
-        if (!cfg.enabled) return
-        if (!inWhitelist(cfg.whitelist, talker)) return
+        // 如果本地已经有配置缓存，直接在微秒级内快速过滤非白名单会话
+        if (ConfigBridge.hasLoadedConfig()) {
+            val fastCfg = ConfigBridge.get(ctx)
+            if (!fastCfg.enabled || !inWhitelist(fastCfg.whitelist, talker)) return
+        }
 
-        val rawContent = strField(msg, DexMap.F_CONTENT).orEmpty()
+        val rawContent = values.getAsString("content").orEmpty()
         if (rawContent.isEmpty()) return
 
-        val msgId = longField(msg, DexMap.F_MSG_ID) ?: 0L
-        val svrId = longField(msg, DexMap.F_SVR_ID) ?: 0L
+        val msgId = values.getAsLong("msgId") ?: 0L
+        val svrId = values.getAsLong("msgSvrId") ?: 0L
 
         pool.execute {
+            val cfg = ConfigBridge.ensureLoadedOnWorker(ctx)
+            if (!cfg.enabled || !inWhitelist(cfg.whitelist, talker)) return@execute
             processCandidate(cfg, talker, rawContent, msgId, svrId, msgTimeMs)
         }
     }
@@ -176,7 +180,6 @@ object ReplyEngine {
 
     private fun sanitize(text: String, maxChars: Int): String {
         var s = text.trim()
-        // 去掉模型爱加的包裹引号
         val quotePairs = listOf("「" to "」", "\"" to "\"", "'" to "'", "“" to "”", "‘" to "’")
         for ((open, close) in quotePairs) {
             if (s.length > 2 && s.startsWith(open) && s.endsWith(close)) {
@@ -267,43 +270,4 @@ object ReplyEngine {
             }
         }
     }
-
-    // ---------------------------------------------------------------- 反射读字段
-
-    private fun fieldOf(clazz: Class<*>, name: String): Field? {
-        val key = clazz.name + "#" + name
-        fieldCache[key]?.let { return it }
-        if (fieldCache.containsKey(key)) return null
-
-        var c: Class<*>? = clazz
-        var found: Field? = null
-        while (c != null && c != Any::class.java) {
-            try {
-                val f = c.getDeclaredField(name)
-                f.isAccessible = true
-                found = f
-                break
-            } catch (_: NoSuchFieldException) {
-                c = c.superclass
-            } catch (t: Throwable) {
-                L.e("field lookup failed: $key", t)
-                break
-            }
-        }
-        fieldCache[key] = found
-        return found
-    }
-
-    private fun anyField(msg: Any, name: String): Any? = try {
-        fieldOf(msg.javaClass, name)?.get(msg)
-    } catch (t: Throwable) {
-        L.e("read field $name failed", t)
-        null
-    }
-
-    private fun intField(msg: Any, name: String): Int? = (anyField(msg, name) as? Number)?.toInt()
-
-    private fun longField(msg: Any, name: String): Long? = (anyField(msg, name) as? Number)?.toLong()
-
-    private fun strField(msg: Any, name: String): String? = anyField(msg, name) as? String
 }

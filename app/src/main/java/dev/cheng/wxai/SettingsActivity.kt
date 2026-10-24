@@ -21,4 +21,9 @@ class SettingsActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        Prefs.broadcastCurrent(this)
+    }
 }

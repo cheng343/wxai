@@ -1,7 +1,6 @@
 package dev.cheng.wxai
 
 import android.app.Application
-import android.app.Instrumentation
 import android.content.Context
 import android.content.pm.PackageInfo
 import android.os.Build
@@ -9,80 +8,90 @@ import de.robv.android.xposed.IXposedHookLoadPackage
 import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * LSPosed 入口（assets/xposed_init 指向这里）。
  *
- * 只在微信主进程初始化；在 Application.onCreate 完成后延迟后台启动，
- * 避开 TinkerApplication 启动期 ClassLoader 锁竞争与早期 IPC 阻塞。
+ * 启动时序完全对齐 WeKit (UnifiedEntryPoint + StartupAgent)：
+ * 1. 仅在微信主进程 (com.tencent.mm) 挂载，跳过 :push / :tools / :appbrand 等子进程；
+ * 2. 先挂 com.tencent.mm.app.Application.attachBaseContext(Context)，拿到 Tinker 完成后的真实 ClassLoader；
+ * 3. 在 attachBaseContext 结束时立即挂 com.tencent.mm.app.h3.a 屏蔽堆栈检测并清理 app_qqprotect；
+ * 4. 在 Instrumentation.callApplicationOnCreate 结束后执行轻量级注册（启动期零跨进程 IPC、零数据库查询、零轮询线程）。
  */
 class MainHook : IXposedHookLoadPackage {
 
+    private val attachHooked = AtomicBoolean(false)
     private val booted = AtomicBoolean(false)
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
         if (lpparam.packageName != TARGET_PACKAGE) return
-        // 只挂主进程：push / tools 等进程没有消息库写入权限，挂上只会重复回复
-        if (!lpparam.processName.equals(TARGET_PACKAGE, ignoreCase = true)) {
-            L.i("skip secondary process: ${lpparam.processName}")
+        if (lpparam.processName != TARGET_PACKAGE) {
             return
         }
 
         L.i("module loading in ${lpparam.processName}")
-        val cl = lpparam.classLoader
+        val initCl = lpparam.classLoader
 
         try {
             XposedHelpers.findAndHookMethod(
-                Instrumentation::class.java,
-                "callApplicationOnCreate",
-                Application::class.java,
+                "com.tencent.mm.app.Application",
+                initCl,
+                "attachBaseContext",
+                Context::class.java,
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        val app = param.args.firstOrNull() as? Application ?: return
-                        scheduleBoot(app, cl)
+                        if (!attachHooked.compareAndSet(false, true)) return
+                        val app = param.thisObject as? Application ?: return
+                        val baseCtx = param.args.firstOrNull() as? Context ?: app
+                        val currentCl = baseCtx.classLoader ?: app.classLoader ?: initCl
+
+                        onAttachBaseContext(app, currentCl)
                     }
                 }
             )
         } catch (t: Throwable) {
-            L.e("hook Instrumentation.callApplicationOnCreate failed, fallback to Application.attach", t)
-            try {
-                XposedHelpers.findAndHookMethod(
-                    Application::class.java,
-                    "attach",
-                    Context::class.java,
-                    object : XC_MethodHook() {
-                        override fun afterHookedMethod(param: MethodHookParam) {
-                            val ctx = param.args.firstOrNull() as? Context ?: return
-                            scheduleBoot(ctx, cl)
+            L.e("hook com.tencent.mm.app.Application.attachBaseContext failed", t)
+        }
+    }
+
+    private fun onAttachBaseContext(app: Application, cl: ClassLoader) {
+        // 清理 app_qqprotect（对齐 WeKit StartupAgent）
+        runCatching {
+            File(app.dataDir, "app_qqprotect").deleteRecursively()
+        }
+
+        // 立即拦截微信 Xposed 堆栈检测（h3.a），确保 Application.onCreate 期间已在保护之下
+        installAntiDetect(cl)
+
+        try {
+            XposedHelpers.findAndHookMethod(
+                "android.app.Instrumentation",
+                cl,
+                "callApplicationOnCreate",
+                Application::class.java,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (!booted.compareAndSet(false, true)) return
+                        val application = param.args.firstOrNull() as? Application ?: app
+                        val realCl = application.baseContext?.classLoader
+                            ?: application.classLoader
+                            ?: cl
+                        try {
+                            boot(application, realCl)
+                        } catch (t: Throwable) {
+                            L.e("boot failed", t)
                         }
                     }
-                )
-            } catch (t2: Throwable) {
-                L.e("hook Application.attach failed", t2)
-            }
+                }
+            )
+        } catch (t: Throwable) {
+            L.e("hook Instrumentation.callApplicationOnCreate failed", t)
         }
     }
 
-    private fun scheduleBoot(ctx: Context, cl: ClassLoader) {
-        if (!booted.compareAndSet(false, true)) return
-        val appCtx = ctx.applicationContext ?: ctx
-        Thread({
-            try {
-                // 等待微信主界面与 Tinker/MMKernel 完成启动，避免启动期 ClassLoader 争用
-                Thread.sleep(2500L)
-                boot(appCtx, cl)
-            } catch (t: Throwable) {
-                L.e("boot failed", t)
-            }
-        }, "wxai-boot").apply {
-            isDaemon = true
-            start()
-        }
-    }
-
-    private fun boot(ctx: Context, cl: ClassLoader) {
-        // 关键防护 1：拦截微信自己的 Xposed 堆栈检测（h3.a），防止异常上报时触发自杀
+    private fun installAntiDetect(cl: ClassLoader) {
         try {
             XposedHelpers.findAndHookMethod(
                 DexMap.ANTI_DETECT_CLASS,
@@ -99,7 +108,9 @@ class MainHook : IXposedHookLoadPackage {
         } catch (t: Throwable) {
             L.w("anti-detect hook skip or failed: ${t.message}")
         }
+    }
 
+    private fun boot(ctx: Context, cl: ClassLoader) {
         val info = packageInfo(ctx)
         val versionName = info?.versionName ?: "?"
         val versionCode = longVersionCode(info)
@@ -112,13 +123,8 @@ class MainHook : IXposedHookLoadPackage {
             )
         }
 
+        // 启动期只读微信本地镜像 SharedPreferences + 注册广播，绝不发起跨进程 ContentProvider 请求
         ConfigBridge.init(ctx)
-        val cfg = ConfigBridge.get(ctx, force = true)
-        L.verbose = cfg.debug
-        L.i("config: enabled=${cfg.enabled} whitelist=${cfg.whitelist.size} model=${cfg.model} baseUrl=${cfg.baseUrl}")
-        if (cfg.enabled && cfg.apiKey.isBlank()) {
-            L.w("enabled=true but apiKey is empty — replies will fail")
-        }
 
         try {
             Hooks.install(ctx, cl)
@@ -126,7 +132,6 @@ class MainHook : IXposedHookLoadPackage {
             L.e("Hooks.install failed", t)
         }
 
-        // 会话枚举（白名单选择器用）：独立于回复链路，失败不影响自动回复
         try {
             ConversationBridge.install(ctx, cl)
         } catch (t: Throwable) {

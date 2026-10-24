@@ -8,7 +8,7 @@ import android.content.IntentFilter
 import android.database.Cursor
 import android.net.Uri
 import android.os.Build
-import android.os.SystemClock
+import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedHelpers
 import java.lang.reflect.Modifier
 import kotlin.concurrent.thread
@@ -16,21 +16,17 @@ import kotlin.concurrent.thread
 /**
  * 微信进程侧的会话枚举器。
  *
- * 8.0.76 (3141) 逆向验证结构：
- * - MMKernel (hm0.j1) 静态字段 m 持有 hm0.j1 单例，其实例字段 d 持有 CoreStorage (hm0.b0)
- *   （直接反射读字段可避免调 hm0.j1.u() 在未登录/早期阶段触发 Lp06/a; 断言异常）
- * - CoreStorage (hm0.b0) 的字段 `public s85.k0 f` 以及 MsgInfoStorage (com.tencent.mm.storage.f9)
- *   的字段 `public final s85.k0 r`，其声明类型为接口 `s85.k0`，运行时类型均为 `ka5.b0` (SqliteDBWrapper)
- * - `ka5.b0.P()`（内部调用 `this.b.e()`）返回 `com.tencent.wcdb.database.SQLiteDatabase`
+ * 完全对齐 WeKit (WeDatabaseApi) 的被动式数据库句柄获取：
+ * 1. 启动期绝不启动轮询线程、绝不执行 rawQuery SQL、绝不主动调用跨进程 ContentProvider；
+ * 2. 被动通过两条轻量通道记录 SQLiteDatabase 引用：
+ *    a) SQLiteDatabase.insertWithOnConflict("message" | "rconversation", ...) 的 thisObject 就是 EnMicroMsg.db；
+ *    b) hm0.j1.u() 的返回值 CoreStorage (hm0.b0) -> ka5.b0 -> P()；
+ * 3. 只有当用户在 WXAI 模块界面点击「从微信选择会话 / 刷新」发出广播时，才在后台线程执行一次查询并回推。
  */
 object ConversationBridge {
 
     private const val TAG = "WXAI/Conv"
     private const val SQLITE_INTERFACE = "s85.k0"
-
-    /** 等待微信内核初始化的轮询：60 次 × 3s = 3 分钟 */
-    private const val WAIT_TRIES = 60
-    private const val WAIT_INTERVAL_MS = 3_000L
 
     @Volatile
     private var database: Any? = null
@@ -48,53 +44,49 @@ object ConversationBridge {
             L.e("$TAG register receiver failed", t)
         }
 
-        thread(name = "wxai-conv-init", isDaemon = true) {
-            awaitKernel(app, cl)
+        // 对齐 WeKit WeDatabaseApi.onEnable：被动挂 hm0.j1.u()，只在微信自己调用时顺手记下 DB 引用，不做任何查询
+        try {
+            XposedHelpers.findAndHookMethod(
+                DexMap.MM_KERNEL,
+                cl,
+                DexMap.MM_KERNEL_GET_STORAGE,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (database != null) return
+                        val storageObj = param.result ?: return
+                        tryCaptureQuietly(storageObj)
+                    }
+                }
+            )
+        } catch (t: Throwable) {
+            L.w("$TAG hook ${DexMap.MM_KERNEL}.${DexMap.MM_KERNEL_GET_STORAGE} skipped: ${t.message}")
         }
     }
 
     /**
-     * 当 Hooks 拦截到 f9.I9 插入消息时调用：f9.r 同样持有 ka5.b0 数据库包装器，可作为双保险捕获通道。
+     * 当 SQLiteDatabase.insertWithOnConflict 操作 message / rconversation 表时，
+     * thisObject 本身就是 EnMicroMsg.db 的 SQLiteDatabase 实例，直接记录即可。
      */
-    fun onStorageSeen(ctx: Context, storageObj: Any) {
-        if (database != null) return
-        val app = ctx.applicationContext ?: ctx
-        thread(name = "wxai-conv-capture", isDaemon = true) {
-            tryCapture(app, storageObj)
+    fun onSqliteDatabaseSeen(dbObj: Any) {
+        if (database == null) {
+            database = dbObj
+            L.i("$TAG database captured from insertWithOnConflict: ${dbObj.javaClass.name}")
         }
     }
 
     // ---------------- 取 DB 句柄 ----------------
 
-    private fun awaitKernel(ctx: Context, cl: ClassLoader) {
-        for (i in 1..WAIT_TRIES) {
-            if (database != null) {
-                pushSnapshot(ctx)
-                return
-            }
-            if (tryCaptureFromKernel(ctx, cl)) {
-                return
-            }
-            SystemClock.sleep(WAIT_INTERVAL_MS)
-        }
-        L.w("$TAG kernel not ready after ${WAIT_TRIES * WAIT_INTERVAL_MS / 1000}s")
-    }
-
-    private fun tryCaptureFromKernel(ctx: Context, cl: ClassLoader? = appClassLoader): Boolean {
+    private fun tryCaptureFromKernel(cl: ClassLoader? = appClassLoader): Boolean {
         if (database != null) return true
         val loader = cl ?: return false
         val coreStorage = getCoreStorageQuietly(loader) ?: return false
-        tryCapture(ctx, coreStorage)
+        tryCaptureQuietly(coreStorage)
         return database != null
     }
 
-    /**
-     * 静默通过静态字段读取 hm0.j1.m -> d (hm0.b0)，不调用会抛 AssertionFailedError 的 hm0.j1.u()。
-     */
     private fun getCoreStorageQuietly(cl: ClassLoader): Any? {
         return try {
             val kernelCls = XposedHelpers.findClass(DexMap.MM_KERNEL, cl)
-            // 1) 找 hm0.j1 自身类型的静态单例字段（8.0.76 为 m）
             val kernelInst = kernelCls.declaredFields.firstNotNullOfOrNull { f ->
                 if (!Modifier.isStatic(f.modifiers) || f.type != kernelCls) return@firstNotNullOfOrNull null
                 try {
@@ -105,10 +97,9 @@ object ConversationBridge {
                 }
             } ?: return null
 
-            // 2) 在 hm0.j1 实例上找 hm0.b0 (CoreStorage) 字段（8.0.76 为 d）
             for (f in kernelCls.declaredFields) {
                 if (Modifier.isStatic(f.modifiers)) continue
-                if (f.name == "d" || f.type.name == "hm0.b0") {
+                if (f.name == "d" || f.type.name == DexMap.CORE_STORAGE) {
                     f.isAccessible = true
                     val v = f.get(kernelInst)
                     if (v != null) return v
@@ -120,28 +111,19 @@ object ConversationBridge {
         }
     }
 
-    private fun tryCapture(ctx: Context, storageObj: Any) {
+    private fun tryCaptureQuietly(storageObj: Any) {
         if (database != null) return
-        var capturedNow = false
         synchronized(this) {
             if (database == null) {
                 val handle = findDatabaseHandle(storageObj)
                 if (handle != null) {
                     database = handle
-                    capturedNow = true
                     L.i("$TAG database ready: ${handle.javaClass.name}")
                 }
             }
         }
-        if (capturedNow) {
-            pushSnapshot(ctx)
-        }
     }
 
-    /**
-     * 从 CoreStorage (hm0.b0) 或 MsgInfoStorage (f9) 里提取 SQLiteDatabase：
-     * 检查运行时类型为 ka5.b0 或声明类型为 s85.k0 的字段，再调用其返回 SQLiteDatabase 的无参方法 P()。
-     */
     private fun findDatabaseHandle(storageObj: Any): Any? {
         if (storageObj.javaClass.name == DexMap.SQLITE_WRAPPER) {
             callDatabaseAccessor(storageObj)?.let { return it }
@@ -163,7 +145,6 @@ object ConversationBridge {
                 val runtimeName = value.javaClass.name
                 val declaredName = f.type.name
                 if (runtimeName.contains("SQLiteDatabase")) {
-                    L.i("$TAG direct SQLiteDatabase field ${c.name}#${f.name}")
                     return value
                 }
                 if (runtimeName == DexMap.SQLITE_WRAPPER ||
@@ -172,7 +153,6 @@ object ConversationBridge {
                 ) {
                     val db = callDatabaseAccessor(value)
                     if (db != null) {
-                        L.i("$TAG db handle via ${c.name}#${f.name} (declared=$declaredName, runtime=$runtimeName)")
                         return db
                     }
                 }
@@ -182,9 +162,7 @@ object ConversationBridge {
         return null
     }
 
-    /** 在 ka5.b0 的类层级里找 无参 且 返回类型含 "SQLiteDatabase" 的方法并调用。 */
     private fun callDatabaseAccessor(wrapper: Any): Any? {
-        // 先检查 ka5.b0.b (底层 ka5.f) 是否已初始化，避免在未打开时调用 P() 触发 NPE
         try {
             val bField = wrapper.javaClass.getDeclaredField("b")
             bField.isAccessible = true
@@ -203,10 +181,7 @@ object ConversationBridge {
                 try {
                     m.isAccessible = true
                     val r = m.invoke(wrapper)
-                    if (r != null) {
-                        L.i("$TAG accessor ${c.name}#${m.name}(): ${m.returnType.name}")
-                        return r
-                    }
+                    if (r != null) return r
                 } catch (_: Throwable) {
                 }
             }
@@ -215,12 +190,12 @@ object ConversationBridge {
         return null
     }
 
-    // ---------------- 查询会话 ----------------
+    // ---------------- 查询会话（仅在收到刷新广播时执行） ----------------
 
     fun snapshot(): ConvSnapshot {
         val db = database
             ?: return ConvSnapshot(
-                error = "微信数据库还没准备好。请保持微信在前台几秒后重试（若一直失败请重启微信）。",
+                error = "微信数据库还没准备好。请先进入微信主界面后再点刷新。",
                 timestamp = System.currentTimeMillis(),
             )
 
@@ -236,11 +211,9 @@ object ConversationBridge {
 
         val items = ArrayList<ConvEntry>(64)
         try {
-            // 按位置取列：SQL 是我们自己写的，顺序固定，比按列名匹配更抗混淆
-            // 0=username 1=unReadCount 2=nickname 3=conRemark 4=type
             if (cursor.columnCount < 3) {
                 return ConvSnapshot(
-                    error = "会话查询返回的列数异常（${cursor.columnCount}），可能是一版微信改了表结构",
+                    error = "会话查询返回的列数异常（${cursor.columnCount}）",
                     timestamp = System.currentTimeMillis(),
                 )
             }
@@ -288,11 +261,9 @@ object ConversationBridge {
                 val pt = m.parameterTypes
                 if (pt[0] != String::class.java) continue
                 if (!pt[1].isArray) continue
-                // 优先 (String, String[])，其次 (String, Object[])
                 if (pt[1].componentType != String::class.java && pt[1].componentType != Any::class.java) continue
                 try {
                     m.isAccessible = true
-                    @Suppress("UNCHECKED_CAST")
                     val r = m.invoke(db, sql, null)
                     if (r is Cursor) return r
                 } catch (t: Throwable) {
@@ -329,7 +300,7 @@ object ConversationBridge {
                 thread(name = "wxai-conv-query", isDaemon = true) {
                     try {
                         if (database == null) {
-                            tryCaptureFromKernel(ctx)
+                            tryCaptureFromKernel()
                         }
                         pushSnapshot(ctx)
                     } catch (t: Throwable) {
@@ -348,5 +319,6 @@ object ConversationBridge {
         L.i("$TAG refresh receiver registered for ${ConversationProtocol.ACTION_LIST_CONVERSATIONS}")
     }
 }
+
 
 

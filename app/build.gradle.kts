@@ -11,8 +11,8 @@ android {
         applicationId = "dev.cheng.wxai"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.2.3"
+        versionCode = 7
+        versionName = "1.2.4"
     }
 
     buildFeatures {
@@ -29,6 +29,9 @@ android {
             storePassword = "android"
             keyAlias = "androiddebugkey"
             keyPassword = "android"
+            enableV1Signing = true
+            enableV2Signing = true
+            enableV3Signing = true
         }
     }
 
@@ -65,6 +68,12 @@ android {
     }
 
     packaging {
+        dex {
+            useLegacyPackaging = true
+        }
+        jniLibs {
+            useLegacyPackaging = true
+        }
         resources.excludes += setOf(
             "META-INF/*.kotlin_module",
             "META-INF/*.version",

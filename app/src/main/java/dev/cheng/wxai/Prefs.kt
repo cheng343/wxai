@@ -36,6 +36,18 @@ object Prefs {
     fun save(ctx: Context, cfg: Config) {
         val json = cfg.toJson().toString()
         prefs(ctx).edit().putString(KEY_CONFIG_JSON, json).commit()
+        broadcastJson(ctx, json)
+    }
+
+    /** 将当前保存的配置通过广播同步给正在运行的微信进程。 */
+    fun broadcastCurrent(ctx: Context) {
+        val raw = prefs(ctx).getString(KEY_CONFIG_JSON, null)
+        if (!raw.isNullOrBlank()) {
+            broadcastJson(ctx, raw)
+        }
+    }
+
+    private fun broadcastJson(ctx: Context, json: String) {
         try {
             val intent = Intent(ConversationProtocol.ACTION_CONFIG_UPDATED)
                 .setPackage(ConversationProtocol.WECHAT_PACKAGE)
