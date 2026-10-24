@@ -31,6 +31,7 @@ object Hooks {
         }
 
         if (wekitCl != null) {
+            MessageSender.setWeKitClassLoader(wekitCl)
             ConversationBridge.setWeKitClassLoader(wekitCl)
             if (attachToWeKitListener(wekitCl)) {
                 L.i("attached to WeKit WeDatabaseListenerApi (0 Xposed hooks installed)")

@@ -10,13 +10,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * 走微信原生发送链路发文本（对齐 WeKit WeMessageApi.sendText）：
- *   NetSceneSendMsg(talker, content, type=1, flag=0, null)
- *     -> NetSceneQueue.e() 取队列
- *     -> queue.g(scene) 投递
- *
- * 启动期只保存 ClassLoader，不做任何类加载或反射扫描；
- * 全程使用标准 Class.forName，绝不依赖 Legacy XposedHelpers。
+ * 走微信发送链路发文本（优先使用 WeKit 的 WeMessageApi.sendText，回退微信原生 NetSceneSendMsg）。
  */
 object MessageSender {
 
@@ -24,13 +18,19 @@ object MessageSender {
     private var appClassLoader: ClassLoader? = null
 
     @Volatile
+    private var wekitClassLoader: ClassLoader? = null
+
+    @Volatile
+    private var weMessageApiSendText: Method? = null
+
+    @Volatile
+    private var weMessageApiInstance: Any? = null
+
+    @Volatile
     private var resolved = false
 
     @Volatile
     private var sceneCtor: Constructor<*>? = null
-
-    @Volatile
-    private var ctorArgCount: Int = 5
 
     @Volatile
     private var queueGetter: Method? = null
@@ -44,31 +44,88 @@ object MessageSender {
         appClassLoader = cl
     }
 
+    fun setWeKitClassLoader(cl: ClassLoader) {
+        wekitClassLoader = cl
+        resolveWeKitSendText(cl)
+    }
+
+    private fun resolveWeKitSendText(cl: ClassLoader) {
+        try {
+            val apiCls = Class.forName("dev.ujhhgtg.wekit.features.api.core.WeMessageApi", false, cl)
+            val inst = apiCls.getDeclaredField("INSTANCE").apply { isAccessible = true }.get(null)
+            val method = apiCls.getDeclaredMethod("sendText", String::class.java, String::class.java).apply {
+                isAccessible = true
+            }
+            weMessageApiInstance = inst
+            weMessageApiSendText = method
+            L.i("WeKit WeMessageApi.sendText resolved successfully")
+        } catch (t: Throwable) {
+            L.w("resolveWeKitSendText skipped or failed: ${t.message}")
+        }
+    }
+
     @Synchronized
     private fun ensureResolved(): Boolean {
         if (resolved) return true
         val cl = appClassLoader ?: return false
+
+        // 如果 WeKit ClassLoader 存在但尚未解析 WeMessageApi，先尝试一次
+        val wkCl = wekitClassLoader
+        if (wkCl != null && weMessageApiSendText == null) {
+            resolveWeKitSendText(wkCl)
+        }
+        if (weMessageApiSendText != null && weMessageApiInstance != null) {
+            resolved = true
+            return true
+        }
+
         return try {
             val sCls = Class.forName(DexMap.SEND_SCENE, false, cl)
-            val ctor5 = sCls.declaredConstructors.firstOrNull { c ->
+
+            // 优先匹配适合我们调用入参的构造函数
+            val ctors = sCls.declaredConstructors
+            var selected: Constructor<*>? = null
+
+            // 1. 尝试 5 参数: (String, String, int, int, Object)
+            selected = ctors.firstOrNull { c ->
                 val p = c.parameterTypes
                 p.size == 5 &&
                     p[0] == String::class.java &&
                     p[1] == String::class.java &&
                     p[2] == Int::class.javaPrimitiveType &&
-                    p[3] == Int::class.javaPrimitiveType
+                    p[3] == Int::class.javaPrimitiveType &&
+                    !p[4].isPrimitive
             }
-            val ctor = ctor5 ?: sCls.declaredConstructors.firstOrNull { c ->
-                val p = c.parameterTypes
-                p.size == 6 &&
-                    p[0] == String::class.java &&
-                    p[1] == String::class.java &&
-                    p[2] == Int::class.javaPrimitiveType &&
-                    p[3] == Int::class.javaPrimitiveType
-            } ?: throw IllegalStateException("NetSceneSendMsg ctor not found in ${sCls.name}")
+
+            // 2. 尝试 6 参数: (String, String, int, int, Object, String)
+            if (selected == null) {
+                selected = ctors.firstOrNull { c ->
+                    val p = c.parameterTypes
+                    p.size == 6 &&
+                        p[0] == String::class.java &&
+                        p[1] == String::class.java &&
+                        p[2] == Int::class.javaPrimitiveType &&
+                        p[3] == Int::class.javaPrimitiveType &&
+                        !p[4].isPrimitive &&
+                        p[5] == String::class.java
+                }
+            }
+
+            // 3. 兜底匹配任意一个前 4 个参数符合 (String, String, int, int) 的构造器
+            if (selected == null) {
+                selected = ctors.firstOrNull { c ->
+                    val p = c.parameterTypes
+                    p.size >= 4 &&
+                        p[0] == String::class.java &&
+                        p[1] == String::class.java &&
+                        p[2] == Int::class.javaPrimitiveType &&
+                        p[3] == Int::class.javaPrimitiveType
+                }
+            }
+
+            val ctor = selected ?: throw IllegalStateException("NetSceneSendMsg ctor not found in ${sCls.name}")
             ctor.isAccessible = true
             sceneCtor = ctor
-            ctorArgCount = ctor.parameterCount
 
             val getterCls = Class.forName(DexMap.QUEUE_GETTER, false, cl)
             val getter = getterCls.declaredMethods.firstOrNull { m ->
@@ -88,7 +145,7 @@ object MessageSender {
             queuePost = post
 
             resolved = true
-            L.i("sender resolved lazily: ${sCls.name} (args=$ctorArgCount)")
+            L.i("sender resolved native fallback: ${sCls.name} (params=${ctor.parameterTypes.joinToString { it.simpleName }})")
             true
         } catch (t: Throwable) {
             L.e("sender lazy resolve failed", t)
@@ -96,7 +153,7 @@ object MessageSender {
         }
     }
 
-    /** 将构建 NetSceneSendMsg 与入队投递到主线程执行，等待最多 5 秒返回结果。 */
+    /** 将发送逻辑投递到主线程执行，等待最多 5 秒返回结果。 */
     fun sendText(talker: String, text: String): Boolean {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             return doSendOnMain(talker, text)
@@ -122,20 +179,74 @@ object MessageSender {
             L.w("sendText skipped: sender not resolved")
             return false
         }
+
+        // 优先通过 WeKit 的 WeMessageApi.sendText 发送
+        val wkMethod = weMessageApiSendText
+        val wkInst = weMessageApiInstance
+        if (wkMethod != null && wkInst != null) {
+            try {
+                val ok = wkMethod.invoke(wkInst, talker, text) as? Boolean ?: false
+                if (ok) {
+                    L.i("sent via WeKit WeMessageApi -> $talker: ${text.take(40)}")
+                    return true
+                }
+                L.w("WeKit WeMessageApi returned false, trying native fallback")
+            } catch (t: Throwable) {
+                L.e("WeKit WeMessageApi.sendText threw, trying native fallback", t)
+            }
+        }
+
+        // 兜底：微信原生 NetSceneQueue 投递
         return try {
             val ctor = sceneCtor!!
-            val scene = if (ctorArgCount == 6) {
-                ctor.newInstance(talker, text, DexMap.TYPE_TEXT, 0, null, 0L)
-            } else {
-                ctor.newInstance(talker, text, DexMap.TYPE_TEXT, 0, null)
+            val paramTypes = ctor.parameterTypes
+            val args = arrayOfNulls<Any>(paramTypes.size)
+
+            for (i in paramTypes.indices) {
+                args[i] = when (i) {
+                    0 -> talker
+                    1 -> text
+                    2 -> DexMap.TYPE_TEXT
+                    3 -> 0
+                    4 -> {
+                        val pt = paramTypes[4]
+                        when {
+                            pt == Long::class.javaPrimitiveType -> 0L
+                            pt == Int::class.javaPrimitiveType -> 0
+                            pt == String::class.java -> ""
+                            else -> null
+                        }
+                    }
+                    5 -> {
+                        val pt = paramTypes[5]
+                        when {
+                            pt == Long::class.javaPrimitiveType -> 0L
+                            pt == Int::class.javaPrimitiveType -> 0
+                            pt == String::class.java -> ""
+                            else -> null
+                        }
+                    }
+                    else -> {
+                        val pt = paramTypes[i]
+                        when {
+                            pt == Long::class.javaPrimitiveType -> 0L
+                            pt == Int::class.javaPrimitiveType -> 0
+                            pt == Boolean::class.javaPrimitiveType -> false
+                            pt == String::class.java -> ""
+                            else -> null
+                        }
+                    }
+                }
             }
+
+            val scene = ctor.newInstance(*args)
             val queue = queueGetter!!.invoke(null)
                 ?: throw IllegalStateException("queue is null")
             val ok = queuePost!!.invoke(queue, scene) as? Boolean ?: false
             if (ok) L.i("queued -> $talker: ${text.take(40)}") else L.w("queue rejected message to $talker")
             ok
         } catch (t: Throwable) {
-            L.e("sendText failed ($talker)", t)
+            L.e("sendText native fallback failed ($talker)", t)
             false
         }
     }
