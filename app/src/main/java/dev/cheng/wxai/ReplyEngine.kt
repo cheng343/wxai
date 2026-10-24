@@ -62,6 +62,7 @@ object ReplyEngine {
         var firstPendingAt: Long = 0L
         var lastSenderWxid: String? = null
         var lastSenderName: String = ""
+        var lastMsgSvrId: Long = 0L
         var pendingIsSelfCmd: Boolean = false
         var debounceFuture: ScheduledFuture<*>? = null
     }
@@ -126,7 +127,8 @@ object ReplyEngine {
         val ctx = appCtx ?: return
 
         val type = values.getAsInteger("type") ?: return
-        if (type != DexMap.TYPE_TEXT && type != TYPE_QUOTE_REPLY && type != TYPE_IMAGE && type != TYPE_EMOJI) return
+        val isSys = (type == 10000)
+        if (type != DexMap.TYPE_TEXT && type != TYPE_QUOTE_REPLY && type != TYPE_IMAGE && type != TYPE_EMOJI && !isSys) return
 
         val talker = values.getAsString("talker")?.trim().orEmpty()
         if (talker.isEmpty()) return
@@ -134,6 +136,14 @@ object ReplyEngine {
         val rawContent = values.getAsString("content").orEmpty()
         val imgPath = values.getAsString("imgPath")
         if (rawContent.isEmpty() && imgPath.isNullOrEmpty()) return
+
+        // 拍一拍事件过滤：仅当系统消息包含拍了拍事件且被拍对象为我时触发
+        if (isSys) {
+            val isPat = rawContent.contains("拍了拍") &&
+                (rawContent.contains("拍了拍我") || rawContent.contains("拍了拍你") || rawContent.contains("拍了拍")) &&
+                !rawContent.startsWith("我拍了拍")
+            if (!isPat) return
+        }
 
         val isSend = values.getAsInteger("isSend") ?: 0
         if (isSend != 0) {
@@ -179,6 +189,8 @@ object ReplyEngine {
         return t.startsWith("/ai ", ignoreCase = true) ||
             t.startsWith("@ai ", ignoreCase = true) ||
             t.startsWith("#ai ", ignoreCase = true) ||
+            t.startsWith("#人设") ||
+            t.startsWith("#风格") ||
             t in setOf(
                 "#认主", "认主", "#我是主人", "我是主人", "#我是你主人", "我是你主人",
                 "#重置", "#重置会话", "#清除记忆",
@@ -186,6 +198,7 @@ object ReplyEngine {
                 "#状态", "#心境",
                 "#日记", "#看日记",
                 "#好感度", "#档案",
+                "#人设", "#风格",
             )
     }
 
@@ -219,10 +232,12 @@ object ReplyEngine {
                 null to (if (isSelfCmd) stripSelfCommandPrefix(rawContent) else rawContent)
             }
 
-            // 多模态消息处理：图片 (3)、表情包 (47)、引用回复 (822083633) 或纯文本
+            // 多模态与系统事件处理：拍一拍 (10000)、图片 (3)、表情包 (47)、引用回复 (822083633) 或纯文本
+            val isPat = (type == 10000)
             val isMedia = (type == TYPE_IMAGE || type == TYPE_EMOJI)
             val parsedBody = when {
-                type == TYPE_QUOTE_REPLY || (rawBody.trimStart().startsWith("<") && !isMedia) -> {
+                isPat -> "[对方在微信中拍了拍你]"
+                type == TYPE_QUOTE_REPLY || (rawBody.trimStart().startsWith("<") && !isMedia && !isPat) -> {
                     ConversationBridge.parseQuotedMessageText(rawBody) ?: return
                 }
                 type == TYPE_EMOJI -> {
@@ -254,7 +269,19 @@ object ReplyEngine {
             }
 
             if (parsedBody.isEmpty()) return
-            if (!isMedia && looksLikeSystemOrMedia(parsedBody)) return
+            if (!isMedia && !isPat && looksLikeSystemOrMedia(parsedBody)) return
+
+            // 拍一拍自动反击互动：收到拍一拍后 600ms 自动在微信里拍回去！
+            if (isPat && cfg.enablePatResponse) {
+                val patTarget = senderWxid?.takeIf { it.isNotBlank() } ?: talker
+                pool.execute {
+                    try {
+                        Thread.sleep(600L)
+                        MessageSender.sendPat(talker, patTarget)
+                    } catch (_: Throwable) {
+                    }
+                }
+            }
 
             val dedupeKey = when {
                 svrId != 0L -> "s$svrId"
@@ -308,6 +335,7 @@ object ReplyEngine {
                 state.pendingLines.add(formattedLine)
                 state.lastSenderWxid = senderWxid
                 state.lastSenderName = senderName
+                state.lastMsgSvrId = svrId
                 state.pendingIsSelfCmd = state.pendingIsSelfCmd || isSelfCmd
 
                 // 计算防抖等待窗口：允许用户把连续两三句短话打完再一次性合并送入大模型
@@ -345,6 +373,7 @@ object ReplyEngine {
         val mergedInput: String
         val senderWxid: String?
         val senderName: String
+        val quoteSvrId: Long
         val isSelfCmd: Boolean
 
         synchronized(state) {
@@ -352,8 +381,10 @@ object ReplyEngine {
             mergedInput = state.pendingLines.joinToString("\n")
             senderWxid = state.lastSenderWxid
             senderName = state.lastSenderName
+            quoteSvrId = state.lastMsgSvrId
             isSelfCmd = state.pendingIsSelfCmd
             state.pendingLines.clear()
+            state.lastMsgSvrId = 0L
             state.pendingIsSelfCmd = false
             state.debounceFuture = null
         }
@@ -368,6 +399,7 @@ object ReplyEngine {
                 mergedUserMsg = mergedInput,
                 senderWxid = senderWxid,
                 senderName = senderName,
+                quoteSvrId = quoteSvrId,
                 isSelfCmd = isSelfCmd,
             )
         }
@@ -382,6 +414,7 @@ object ReplyEngine {
         mergedUserMsg: String,
         senderWxid: String?,
         senderName: String,
+        quoteSvrId: Long,
         isSelfCmd: Boolean,
     ) {
         try {
@@ -454,9 +487,10 @@ object ReplyEngine {
                 return
             }
 
-            // 4. 拟人多气泡或单气泡发送
+            // 4. 拟人多气泡或单气泡发送（群聊且开启引用回复时，首条气泡自动引用原消息）
             markAiOutbound(talker, reply)
-            val ok = MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
+            val targetQuote = if (cfg.enableQuoteReply && isGroup && quoteSvrId > 0L) quoteSvrId else 0L
+            val ok = MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble, targetQuote)
             if (ok) {
                 recordReplyFinished(talker)
                 if (cfg.enableMemory) {
@@ -499,7 +533,8 @@ object ReplyEngine {
             "#好感度", "#档案",
             "#日记", "#看日记",
             "#记忆", "#查看记忆",
-        )
+            "#人设", "#风格",
+        ) || c.startsWith("#人设") || c.startsWith("#风格")
     }
 
     private fun handleBuiltinCommand(
@@ -622,6 +657,42 @@ object ReplyEngine {
                 val safeReply = sanitize(reply, cfg.maxReplyChars, false)
                 markAiOutbound(talker, safeReply)
                 MessageSender.sendText(talker, safeReply)
+                return true
+            }
+
+            c.startsWith("#人设") || c.startsWith("#风格") -> {
+                val arg = c.substringAfter(" ", "").trim()
+                    .ifEmpty { c.substringAfter("人设", "").trim() }
+                    .ifEmpty { c.substringAfter("风格", "").trim() }
+
+                if (arg.isEmpty() || arg == "查看" || arg == "列表") {
+                    val reply = "【当前人设风格】${cfg.personaPresetLabel()}||" +
+                        "发送指令可直接切换风格：\n" +
+                        "• #人设 群友（机智网瘾群友，默认高网感接梗）\n" +
+                        "• #人设 女仆（傲娇忠犬女仆，对主人极度顺从护短）\n" +
+                        "• #人设 毒舌（毒舌腹黑损友，神级吐槽与阴阳）\n" +
+                        "• #人设 猫娘（软萌可爱猫娘，句尾带喵超治愈）\n" +
+                        "• #人设 管家（全能高智商管家，严谨靠谱执行力）"
+                    MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
+                    return true
+                }
+
+                val newPreset = when {
+                    arg.contains("群友") || arg.contains("网络") || arg.contains("抽象") -> "group"
+                    arg.contains("女仆") || arg.contains("忠犬") || arg.contains("跟班") -> "maid"
+                    arg.contains("毒舌") || arg.contains("腹黑") || arg.contains("损友") -> "tsundere"
+                    arg.contains("猫娘") || arg.contains("猫") || arg.contains("萌") -> "catgirl"
+                    arg.contains("管家") || arg.contains("执事") || arg.contains("助手") -> "butler"
+                    else -> "group"
+                }
+
+                val updatedCfg = ConfigBridge.updateFromWechat(ctx) { old ->
+                    old.copy(personaPreset = newPreset)
+                }
+
+                val reply = "已成功切换人设风格为：【${updatedCfg.personaPresetLabel()}】！随时发消息来和我互动吧[旺柴]"
+                markAiOutbound(talker, reply)
+                MessageSender.sendText(talker, reply)
                 return true
             }
         }

@@ -374,6 +374,17 @@ fun SettingsScreen() {
                     spec.onApply(min, max)
                 },
             )
+
+            is EditorSpec.Choice -> ChoiceDialog(
+                title = spec.title,
+                options = spec.options,
+                current = spec.current,
+                onDismiss = { editor = null },
+                onSelect = { selected ->
+                    editor = null
+                    spec.onApply(selected)
+                },
+            )
         }
     }
 }
@@ -539,6 +550,42 @@ private fun SoulAndLifeTab(
                     )
                 )
             },
+        )
+    }
+
+    // 人格风格与深度交互（DeepSeek QQ 同款体验）
+    SettingsCard(title = "人格风格与深度交互（DeepSeek QQ 同款体验）") {
+        ValueRow(
+            title = "人格风格预设（微信发 #人设 也可一键切换）",
+            value = cfg.personaPresetLabel(),
+            onClick = {
+                edit(
+                    EditorSpec.Choice(
+                        title = "选择人格风格预设",
+                        options = listOf(
+                            "group" to "🤪 机智网瘾群友（默认，高网感幽默接梗）",
+                            "maid" to "🐱 傲娇忠犬赛博女仆（对主人极度顺从护短）",
+                            "tsundere" to "😈 毒舌腹黑损友（神级吐槽、嘴硬心软）",
+                            "catgirl" to "🌸 软萌可爱猫娘（甜美黏人、句尾带喵~）",
+                            "butler" to "🎩 全能高智商管家（从容优雅、全能靠谱）",
+                        ),
+                        current = cfg.personaPreset,
+                        onApply = { value -> update { it.copy(personaPreset = value) } },
+                    )
+                )
+            },
+        )
+        SwitchRow(
+            title = "微信拍一拍趣味反拍与互动",
+            subtitle = "有人拍你时自动在微信反拍对方，并附带傲娇/机智神回复",
+            checked = cfg.enablePatResponse,
+            onCheckedChange = { value -> update { it.copy(enablePatResponse = value) } },
+        )
+        SwitchRow(
+            title = "群聊优先微信原生引用回复",
+            subtitle = "在群聊被 @ 时，第一条气泡自动引用对方消息卡片发出，让群聊互动更清晰",
+            checked = cfg.enableQuoteReply,
+            onCheckedChange = { value -> update { it.copy(enableQuoteReply = value) } },
         )
     }
 
@@ -1309,5 +1356,12 @@ private sealed interface EditorSpec {
         val initialMin: Int,
         val initialMax: Int,
         val onApply: (Int, Int) -> Unit,
+    ) : EditorSpec
+
+    data class Choice(
+        val title: String,
+        val options: List<Pair<String, String>>,
+        val current: String,
+        val onApply: (String) -> Unit,
     ) : EditorSpec
 }

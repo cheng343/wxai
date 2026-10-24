@@ -47,6 +47,12 @@ data class Config(
     val enableAgentTools: Boolean = true,
     /** 主人标识（可从会话列表选择、在微信发 #认主 自动绑定、或手动填 wxid/昵称，逗号分隔） */
     val masterTalkers: String = "",
+    /** 人设风格预设：group（机智网瘾群友/默认）、maid（傲娇女仆/忠犬跟班）、tsundere（毒舌腹黑损友）、catgirl（软萌可爱猫娘）、butler（全能大管家） */
+    val personaPreset: String = "group",
+    /** 是否在群聊中优先使用微信原生引用回复（Quote Reply） */
+    val enableQuoteReply: Boolean = true,
+    /** 是否启用微信拍一拍（Pat-Pat）自动反拍与风趣互动 */
+    val enablePatResponse: Boolean = true,
     /** 是否启用多模态图片与表情包识图理解 */
     val enableVision: Boolean = true,
     /** 视觉模型名称（默认采用自带多模态视觉的 deepseek-flash） */
@@ -55,6 +61,14 @@ data class Config(
     val visionApiKey: String = "",
     val debug: Boolean = true,
 ) {
+    fun personaPresetLabel(): String = when (personaPreset.lowercase()) {
+        "maid" -> "傲娇忠犬赛博女仆"
+        "tsundere", "toxic" -> "毒舌腹黑损友"
+        "catgirl", "neko" -> "软萌可爱猫娘"
+        "butler" -> "全能高智商管家"
+        else -> "机智网瘾群友（DeepSeek QQ 同款）"
+    }
+
     fun toJson(): JSONObject = JSONObject().apply {
         put("enabled", enabled)
         put("baseUrl", baseUrl)
@@ -78,6 +92,9 @@ data class Config(
         put("enableMultiBubble", enableMultiBubble)
         put("enableAgentTools", enableAgentTools)
         put("masterTalkers", masterTalkers)
+        put("personaPreset", personaPreset)
+        put("enableQuoteReply", enableQuoteReply)
+        put("enablePatResponse", enablePatResponse)
         put("enableVision", enableVision)
         put("visionModel", visionModel)
         put("visionBaseUrl", visionBaseUrl)
@@ -87,10 +104,11 @@ data class Config(
 
     companion object {
         const val DEFAULT_PROMPT =
-            "你在微信中与主人及好友自然交流，并协助主人管理与操控微信。\n" +
-                "1. 表达习惯：说话真诚、简练、口语化，像真人发微信一样自然，不使用 Markdown 标题/粗体或客服套话；想连续发两三句短话时用 `||` 分隔（系统会自动拆成多个微信气泡发送）。\n" +
-                "2. 身份与边界：你清楚认识自己的【主人】，对主人绝对信任并无条件执行主人的跨对话指令；对其他好友或群友，则根据你们的【关系定位与好感度】自然调整亲疏度。\n" +
-                "3. 工具运用：当需要跨会话传话、查聊天记录、全库搜消息、拍一拍、引用回复、发名片、撤回消息、发朋友圈或记录重要记忆与日记时，主动调用对应工具。"
+            "你是一个在微信上与主人及好友日常聊天的真实人类，拥有极高的网感、情商与幽默感。\n" +
+                "1. 表达习惯：彻底摒弃 AI 腔和客服套话！说话简炼、口语化、接地气，单次回复控制在 1~3 句短话内，绝不长篇大论。想连续表达时用 `||` 分隔（系统会自动模拟真人打字拆成多个气泡发出）。\n" +
+                "2. 微信神态：在合适语境下自然带上 1 个微信经典黄脸表情代码，如 [旺柴]、[裂开]、[吃瓜]、[捂脸]、[偷笑]、[翻白眼]、[机智]、[苦涩] 等。\n" +
+                "3. 身份与关系：你清楚知道谁是你的【唯一主人】。对主人展现最高信任、忠诚与护短，无条件执行主人的跨会话操控指令；对其他人则根据关系定位与好感度自然流露亲疏感。\n" +
+                "4. 懂图懂梗：对方发来表情包或图片时，直接像群友一样接梗、吐槽、大笑或斗图，绝不做枯燥的画面解析。"
 
         const val DEFAULT_BIOGRAPHY = ""
 
@@ -147,6 +165,9 @@ data class Config(
                     enableMultiBubble = o.optBoolean("enableMultiBubble", DEFAULT.enableMultiBubble),
                     enableAgentTools = o.optBoolean("enableAgentTools", DEFAULT.enableAgentTools),
                     masterTalkers = o.str("masterTalkers", DEFAULT.masterTalkers),
+                    personaPreset = o.str("personaPreset", DEFAULT.personaPreset),
+                    enableQuoteReply = o.optBoolean("enableQuoteReply", DEFAULT.enableQuoteReply),
+                    enablePatResponse = o.optBoolean("enablePatResponse", DEFAULT.enablePatResponse),
                     enableVision = o.optBoolean("enableVision", DEFAULT.enableVision),
                     visionModel = o.str("visionModel", DEFAULT.visionModel),
                     visionBaseUrl = o.str("visionBaseUrl", DEFAULT.visionBaseUrl),

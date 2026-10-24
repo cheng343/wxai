@@ -236,7 +236,7 @@ object MessageSender {
      * 如果开启了 multiBubble 且模型回复中含有 "||" 或多行自然段落（最多拆 3 条），
      * 自动按真人打字速度逐条发送，让聊天极富生命感。
      */
-    fun sendHumanLikeText(talker: String, rawReply: String, enableMultiBubble: Boolean): Boolean {
+    fun sendHumanLikeText(talker: String, rawReply: String, enableMultiBubble: Boolean, quoteSvrId: Long = 0L): Boolean {
         val segments = if (enableMultiBubble) {
             splitIntoBubbles(rawReply)
         } else {
@@ -248,14 +248,20 @@ object MessageSender {
         for ((idx, seg) in segments.withIndex()) {
             if (seg.isBlank()) continue
             if (idx > 0) {
-                val typingDelay = (seg.length * 65L).coerceIn(550L, 1800L) + Random.nextLong(100L, 400L)
+                val typingDelay = (seg.length * 60L).coerceIn(450L, 1600L) + Random.nextLong(100L, 350L)
                 try {
                     Thread.sleep(typingDelay)
                 } catch (_: InterruptedException) {
                 }
             }
             ReplyEngine.markAiOutbound(talker, seg)
-            if (sendText(talker, seg)) {
+            val ok = if (idx == 0 && quoteSvrId > 0L) {
+                val quoted = sendQuoteText(talker, quoteSvrId, seg)
+                if (!quoted) sendText(talker, seg) else true
+            } else {
+                sendText(talker, seg)
+            }
+            if (ok) {
                 anySuccess = true
             }
         }
@@ -273,6 +279,10 @@ object MessageSender {
         val lines = trimmed.lines().map { it.trim() }.filter { it.isNotEmpty() }
         if (lines.size in 2..3 && trimmed.length <= 180) {
             return lines
+        }
+        val sentenceSplit = trimmed.split(Regex("(?<=[！？!?~～])\\s+"))
+        if (sentenceSplit.size in 2..3 && trimmed.length <= 100) {
+            return sentenceSplit.map { it.trim() }.filter { it.isNotEmpty() }
         }
         return listOf(trimmed)
     }
