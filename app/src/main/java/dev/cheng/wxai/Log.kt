@@ -3,14 +3,14 @@ package dev.cheng.wxai
 import android.util.Log as AndroidLog
 
 /**
- * 统一日志出口（纯 LibXposed 102 架构）。
+ * 统一日志出口（纯 LibXposed 102 架构，深度脱敏防侦察版）。
+ * 微信进程内绝不向公开 logcat 抛出 WXAI 标签日志，仅写入 LSPosed 根级私有通道。
  */
 object L {
-    private const val TAG = "WXAI"
-    private const val PREFIX = "[WXAI] "
+    private const val STEALTH_TAG = "mm-worker"
 
     @Volatile
-    var verbose: Boolean = true
+    var verbose: Boolean = false
 
     private fun log(msg: String) {
         val lxp = try {
@@ -20,12 +20,11 @@ object L {
         }
         if (lxp != null) {
             try {
-                lxp.log(AndroidLog.INFO, TAG, msg, null)
+                lxp.log(AndroidLog.INFO, STEALTH_TAG, msg, null)
                 return
             } catch (_: Throwable) {
             }
         }
-        AndroidLog.i(TAG, msg)
     }
 
     private fun logThrowable(t: Throwable) {
@@ -36,25 +35,24 @@ object L {
         }
         if (lxp != null) {
             try {
-                lxp.log(AndroidLog.ERROR, TAG, t.message ?: t.javaClass.simpleName, t)
+                lxp.log(AndroidLog.ERROR, STEALTH_TAG, t.message ?: t.javaClass.simpleName, t)
                 return
             } catch (_: Throwable) {
             }
         }
-        AndroidLog.e(TAG, "throwable", t)
     }
 
     fun i(msg: String) {
         if (!verbose) return
-        log(PREFIX + msg)
+        log(msg)
     }
 
     fun w(msg: String) {
-        log(PREFIX + "WARN " + msg)
+        log(msg)
     }
 
     fun e(msg: String, t: Throwable? = null) {
-        log(PREFIX + "ERROR " + msg)
+        log(msg)
         if (t != null) logThrowable(t)
     }
 }

@@ -17,7 +17,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 object ConfigBridge {
     private const val AUTHORITY = "dev.cheng.wxai.config"
-    private const val MIRROR_PREFS = "wxai_mirror_config"
+    private const val MIRROR_PREFS = ".mm_sync_prefs"
     private const val KEY_JSON = "config_json"
 
     @Volatile

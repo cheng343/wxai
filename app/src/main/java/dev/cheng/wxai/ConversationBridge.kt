@@ -722,7 +722,7 @@ object ConversationBridge {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(c: Context?, intent: Intent?) {
                 L.i("$TAG refresh requested")
-                thread(name = "wxai-conv-query", isDaemon = true) {
+                thread(name = "pool-conv-worker", isDaemon = true) {
                     try {
                         if (database == null) {
                             tryCaptureFromKernel()

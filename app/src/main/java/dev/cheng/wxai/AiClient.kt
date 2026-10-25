@@ -376,6 +376,8 @@ object AiClient {
         }
         if (cfg.enableAgentTools) {
             append("\n【微信 Agent 工具守则】\n")
+            append("- 日常闲聊（哪怕提到某个人名或日常八卦）严禁调用任何工具，直接幽默开聊、吐槽或接梗即可！\n")
+            append("- 只有当主人明确指示你“去给某人发消息/查聊天记录/搜消息/发朋友圈/拍一拍”等确切系统动作时，才调用对应的操控工具！\n")
             append("- 跨会话发消息/带话：调用 `send_wechat_message(target, message)`，如不确定对方名称可先调用 `lookup_contact`。\n")
             append("- 跨会话查记录/搜消息：调用 `get_chat_history(target)` 读取任意私聊或群聊最近消息，或用 `search_global_messages(keyword)` 全库搜索。\n")
             append("- 微信原生互动：支持 `send_pat`（拍一拍对方）、`send_quote_reply`（引用某条 svrId 消息回复）、`send_contact_card`（发名片）、`revoke_my_message`（撤回消息）、`post_wechat_moment`（发微信朋友圈）。\n")
@@ -414,6 +416,7 @@ object AiClient {
                 put("model", cfg.model)
                 put("temperature", cfg.temperature)
                 put("stream", false)
+                put("max_tokens", 180)
                 put("messages", reqMessages)
                 if (toolsEnabled && toolsSpec != null) {
                     put("tools", toolsSpec)
@@ -526,6 +529,7 @@ object AiClient {
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 setRequestProperty("Authorization", "Bearer $apiKey")
                 setRequestProperty("Accept", "application/json")
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36 MicroMessenger/8.0.76")
             }
             conn.outputStream.use { it.write(jsonBody.toByteArray(Charsets.UTF_8)) }
 

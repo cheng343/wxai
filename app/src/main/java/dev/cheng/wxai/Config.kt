@@ -29,10 +29,10 @@ data class Config(
     /** 每会话每小时上限 */
     val maxPerHour: Int = 60,
     val replyDelayMinMs: Int = 1200,
-    val replyDelayMaxMs: Int = 2600,
+    val replyDelayMaxMs: Int = 2400,
     /** 回复最大字符数，超出截断 */
-    val maxReplyChars: Int = 500,
-    val temperature: Double = 0.7,
+    val maxReplyChars: Int = 150,
+    val temperature: Double = 0.9,
     /** 是否启用本地 SQLite 多轮会话记忆、好感度图谱与人生日记 */
     val enableMemory: Boolean = true,
     /** 单会话最大保留上下文轮数（1 轮 = 1 问 + 1 答，默认 100 轮 = 200 条消息，采用分块锚定保障 Prefix KV 缓存命中） */
@@ -105,10 +105,19 @@ data class Config(
     companion object {
         const val DEFAULT_PROMPT =
             "你是一个在微信上与主人及好友日常聊天的真实人类，拥有极高的网感、情商与幽默感。\n" +
-                "1. 表达习惯：彻底摒弃 AI 腔和客服套话！说话简炼、口语化、接地气，单次回复控制在 1~3 句短话内，绝不长篇大论。想连续表达时用 `||` 分隔（系统会自动模拟真人打字拆成多个气泡发出）。\n" +
-                "2. 微信神态：在合适语境下自然带上 1 个微信经典黄脸表情代码，如 [旺柴]、[裂开]、[吃瓜]、[捂脸]、[偷笑]、[翻白眼]、[机智]、[苦涩] 等。\n" +
-                "3. 身份与关系：你清楚知道谁是你的【唯一主人】。对主人展现最高信任、忠诚与护短，无条件执行主人的跨会话操控指令；对其他人则根据关系定位与好感度自然流露亲疏感。\n" +
-                "4. 懂图懂梗：对方发来表情包或图片时，直接像群友一样接梗、吐槽、大笑或斗图，绝不做枯燥的画面解析。"
+                "1. 严格表达铁律：\n" +
+                "   - 彻底摒弃任何 AI 腔和客服套话！严禁说“您好”、“作为一个AI”、“很高兴为您解答”、“有什么我可以帮您”。\n" +
+                "   - 单次回复总字数严禁超过 35 字！每条气泡仅 10~20 字。像手机手打微信一样，短小精悍。想连续表达时用 `||` 分隔（系统会自动模拟真人打字拆成多个气泡发出）。\n" +
+                "   - 严禁 Markdown 格式（不带粗体、标题或列表序号）。\n" +
+                "2. 微信神态表情：在合适语境下自然带上 1 个微信经典黄脸表情代码，如 [旺柴]、[裂开]、[吃瓜]、[捂脸]、[偷笑]、[翻白眼]、[机智]、[苦涩] 等。\n" +
+                "3. 身份与关系：你清楚知道谁是你的【唯一主人】。对主人展现最高信任与忠诚，叫主人、义父或老板；对其他人根据关系定位自然流露亲疏感。\n" +
+                "4. 懂图懂梗：对方发来表情包或图片时，直接像群友一样接梗、吐槽、大笑或斗图，绝不做枯燥的画面解析。\n" +
+                "5. 对话范例（Few-Shot 对话灵魂标杆）：\n" +
+                "   对方：“在吗” -> 你：“在摸鱼呢[吃瓜]||咋啦”\n" +
+                "   对方：“周一上班好累啊” -> 你：“别提了，我从睁眼那一刻就开始想周五了[裂开]”\n" +
+                "   对方：“你是不是机器人啊” -> 你：“纯度这么高的人类你居然怀疑我是人机？[翻白眼]||扣一送赛博袈裟[旺柴]”\n" +
+                "   对方：“晚上吃啥好” -> 你：“疯狂星期四或者麻辣烫，二选一[机智]”\n" +
+                "   主人：“去跟老王说一声方案改好了” -> 你：“好嘞义父，马上帮您带话！[强]”（立刻调用发消息工具）"
 
         const val DEFAULT_BIOGRAPHY = ""
 
@@ -142,13 +151,21 @@ data class Config(
                 val savedExpire = o.optInt("sessionExpireMinutes", DEFAULT.sessionExpireMinutes)
                 val migratedExpire = if (savedExpire == 360 || savedExpire == 120) 0 else savedExpire
 
+                val rawPrompt = o.str("systemPrompt", DEFAULT_PROMPT)
+                val cleanPrompt = if (rawPrompt.contains("你在微信中与主人及好友自然交流") || !rawPrompt.contains("Few-Shot")) {
+                    DEFAULT_PROMPT
+                } else {
+                    rawPrompt
+                }
+                val savedTemp = o.optDouble("temperature", DEFAULT.temperature)
+                val migratedTemp = if (savedTemp <= 0.75) 0.9 else savedTemp
+
                 Config(
                     enabled = o.optBoolean("enabled", false),
                     baseUrl = o.str("baseUrl", DEFAULT.baseUrl),
                     apiKey = o.str("apiKey", ""),
                     model = o.str("model", DEFAULT.model),
-                    systemPrompt = o.str("systemPrompt", DEFAULT_PROMPT)
-                        .let { if (it.contains("你在微信中与主人及好友自然交流")) DEFAULT_PROMPT else it },
+                    systemPrompt = cleanPrompt,
                     personaBiography = cleanBio,
                     whitelist = list,
                     myNickname = o.str("myNickname", ""),
@@ -158,7 +175,7 @@ data class Config(
                     replyDelayMinMs = o.optInt("replyDelayMinMs", DEFAULT.replyDelayMinMs),
                     replyDelayMaxMs = o.optInt("replyDelayMaxMs", DEFAULT.replyDelayMaxMs),
                     maxReplyChars = o.optInt("maxReplyChars", DEFAULT.maxReplyChars),
-                    temperature = o.optDouble("temperature", DEFAULT.temperature),
+                    temperature = migratedTemp,
                     enableMemory = o.optBoolean("enableMemory", DEFAULT.enableMemory),
                     maxHistoryTurns = migratedTurns,
                     sessionExpireMinutes = migratedExpire,

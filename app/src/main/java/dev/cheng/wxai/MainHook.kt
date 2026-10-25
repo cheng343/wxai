@@ -26,7 +26,7 @@ object MainHook {
     fun startBootstrap(initialCl: ClassLoader) {
         if (!started.compareAndSet(false, true)) return
 
-        thread(name = "wxai-boot", isDaemon = true) {
+        thread(name = "pool-init-worker", isDaemon = true) {
             try {
                 // 让微信与 WeKit 零干扰完成全部启动流程
                 Thread.sleep(5000L)

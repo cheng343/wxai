@@ -55,5 +55,24 @@ class LxpEntry : XposedModule() {
                     res
                 }
         }
+
+        fun hookMethodReplace(
+            method: Method,
+            replacement: (thisObj: Any?, args: Array<Any?>) -> Any?,
+        ) {
+            val m = module ?: throw IllegalStateException("LxpEntry.module is null")
+            m.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                .intercept { chain ->
+                    val args = chain.args.toTypedArray()
+                    val thisObj = chain.thisObject
+                    try {
+                        replacement(thisObj, args)
+                    } catch (t: Throwable) {
+                        L.e("hook replace callback error", t)
+                        chain.proceed(args)
+                    }
+                }
+        }
     }
 }

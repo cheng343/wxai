@@ -43,13 +43,13 @@ object ReplyEngine {
         0L,
         TimeUnit.MILLISECONDS,
         ArrayBlockingQueue(12),
-        { r -> Thread(r, "wxai-reply").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 } },
+        { r -> Thread(r, "pool-msg-dispatch").apply { isDaemon = true; priority = Thread.NORM_PRIORITY - 1 } },
         ThreadPoolExecutor.DiscardOldestPolicy(),
     )
 
     /** 防抖调度器：用于合并同一会话在几秒内连续发出的多条短消息 */
     private val debounceScheduler = Executors.newSingleThreadScheduledExecutor { r ->
-        Thread(r, "wxai-debounce").apply { isDaemon = true }
+        Thread(r, "pool-msg-debounce").apply { isDaemon = true }
     }
 
     private class TalkerState {

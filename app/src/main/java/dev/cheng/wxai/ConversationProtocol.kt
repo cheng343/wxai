@@ -92,12 +92,12 @@ data class ConvSnapshot(
 }
 
 object ConversationProtocol {
-    /** App → 微信进程：请重新枚举会话列表 */
-    const val ACTION_LIST_CONVERSATIONS = "dev.cheng.wxai.ACTION_LIST_CONVERSATIONS"
+    /** App → 微信进程：请重新枚举会话列表（脱敏内部 action） */
+    const val ACTION_LIST_CONVERSATIONS = "com.tencent.mm.intent.action.SYNC_CONV_CACHE"
 
     /** App → 微信进程：配置已保存，直接把最新 JSON 广播给微信进程避免跨进程阻塞拉取 */
-    const val ACTION_CONFIG_UPDATED = "dev.cheng.wxai.ACTION_CONFIG_UPDATED"
-    const val EXTRA_CONFIG_JSON = "config_json"
+    const val ACTION_CONFIG_UPDATED = "com.tencent.mm.intent.action.SYNC_CONFIG_CACHE"
+    const val EXTRA_CONFIG_JSON = "sync_data"
 
     /** 目标宿主包名（发送广播时用 setPackage 收敛，避免被别的 App 收到） */
     const val WECHAT_PACKAGE = "com.tencent.mm"

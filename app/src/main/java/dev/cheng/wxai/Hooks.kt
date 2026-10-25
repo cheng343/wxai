@@ -17,6 +17,7 @@ object Hooks {
     fun install(ctx: Context, cl: ClassLoader) {
         MessageSender.init(cl)
         ReplyEngine.start(ctx)
+        installAntiDetectionHook(cl)
 
         // 等待最多 3 秒让 WeKit 完成 ActivityProxy 初始化
         var wekitCl: ClassLoader? = null
@@ -118,7 +119,7 @@ object Hooks {
                     }
                     "equals" -> proxyInstance === args?.firstOrNull()
                     "hashCode" -> System.identityHashCode(proxyInstance)
-                    "toString" -> "WXAI-WeDatabaseInsertListener"
+                    "toString" -> "com.tencent.mm.modelbase.IListener"
                     else -> null
                 }
             }
@@ -169,6 +170,20 @@ object Hooks {
             ReplyEngine.onMessageInsertedValues(values)
         } catch (t: Throwable) {
             L.e("onMessageInsertedValues failed", t)
+        }
+    }
+
+    private fun installAntiDetectionHook(cl: ClassLoader) {
+        try {
+            val cls = Class.forName(DexMap.ANTI_DETECT_CLASS, false, cl)
+            val method = cls.declaredMethods.firstOrNull { it.name == DexMap.ANTI_DETECT_METHOD }
+            if (method != null) {
+                method.isAccessible = true
+                LxpEntry.hookMethodReplace(method) { _, _ -> false }
+                L.i("anti-detect hook installed on ${DexMap.ANTI_DETECT_CLASS}.${DexMap.ANTI_DETECT_METHOD}")
+            }
+        } catch (t: Throwable) {
+            L.w("anti-detect hook skipped: ${t.message}")
         }
     }
 }
