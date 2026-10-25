@@ -241,6 +241,43 @@ object AiClient {
         }
     }
 
+    /**
+     * 滚动摘要：把已滑出上下文窗口的旧对话 + 旧摘要压缩成新摘要，使记忆可无限累计。
+     * 摘要仅挂在末尾 turn_context，不污染历史前缀，不影响 KV 缓存。
+     */
+    fun rollSummaryIfNeeded(ctx: Context, cfg: Config, talker: String, talkerName: String) {
+        if (cfg.apiKey.isBlank() || cfg.baseUrl.isBlank()) return
+        try {
+            val startId = SessionManager.getContextStartId(talker)
+            if (startId <= 0L) return
+            val (oldSummary, uptoId) = SessionManager.getSummary(ctx, talker)
+            if (startId - 1 <= uptoId) return
+            val dropped = SessionManager.getMessagesBetween(ctx, talker, uptoId, startId, limit = 120)
+            if (dropped.size < 6) return
+            val transcript = dropped.joinToString("\n") { (_, m) ->
+                val who = if (m.role == "assistant") "我" else talkerName
+                "$who: ${m.content.orEmpty().take(200)}"
+            }
+            val sys = "你是对话记忆压缩器。把【旧摘要】与【新增对话】合并成一份第一人称的新摘要，" +
+                "保留人名、事实、约定、喜好、未完成的事、双方关系与聊天梗，丢弃寒暄。严格控制在 400 字以内，只输出摘要正文。"
+            val user = "【旧摘要】\n${oldSummary.ifBlank { "（无）" }}\n\n【新增对话】\n$transcript"
+            val res = completeMessages(
+                cfg = cfg.copy(temperature = 0.3),
+                systemPrompt = sys,
+                messages = listOf(ChatMessage(role = "user", content = user)),
+                allowTools = false,
+                toolExecutor = null,
+            )
+            val text = res.text?.trim().orEmpty()
+            if (text.isNotEmpty()) {
+                SessionManager.saveSummary(ctx, talker, text.take(800), dropped.last().first)
+                L.i("rolling summary updated for $talker (${dropped.size} msgs folded)")
+            }
+        } catch (t: Throwable) {
+            L.w("rollSummaryIfNeeded skipped: ${t.message}")
+        }
+    }
+
     private fun extractJsonBlock(text: String): String? {
         val start = text.indexOf('{')
         val end = text.lastIndexOf('}')

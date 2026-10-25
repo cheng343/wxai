@@ -52,14 +52,14 @@ data class Config(
     /** 是否在群聊中优先使用微信原生引用回复（Quote Reply） */
     val enableQuoteReply: Boolean = true,
     /** 是否启用微信拍一拍（Pat-Pat）自动反拍与风趣互动 */
-    val enablePatResponse: Boolean = true,
+    val enablePatResponse: Boolean = false,
     /** 是否启用多模态图片与表情包识图理解 */
     val enableVision: Boolean = true,
     /** 视觉模型名称（默认采用自带多模态视觉的 deepseek-flash） */
     val visionModel: String = "deepseek-flash",
     val visionBaseUrl: String = "",
     val visionApiKey: String = "",
-    val debug: Boolean = true,
+    val debug: Boolean = false,
 ) {
     fun personaPresetLabel(): String = when (personaPreset.lowercase()) {
         "maid" -> "傲娇忠犬赛博女仆"
@@ -147,7 +147,8 @@ data class Config(
                     baseUrl = o.str("baseUrl", DEFAULT.baseUrl),
                     apiKey = o.str("apiKey", ""),
                     model = o.str("model", DEFAULT.model),
-                    systemPrompt = o.str("systemPrompt", DEFAULT_PROMPT),
+                    systemPrompt = o.str("systemPrompt", DEFAULT_PROMPT)
+                        .let { if (it.contains("你在微信中与主人及好友自然交流")) DEFAULT_PROMPT else it },
                     personaBiography = cleanBio,
                     whitelist = list,
                     myNickname = o.str("myNickname", ""),
@@ -172,7 +173,7 @@ data class Config(
                     visionModel = o.str("visionModel", DEFAULT.visionModel),
                     visionBaseUrl = o.str("visionBaseUrl", DEFAULT.visionBaseUrl),
                     visionApiKey = o.str("visionApiKey", DEFAULT.visionApiKey),
-                    debug = o.optBoolean("debug", true),
+                    debug = false, // 调试 Toast 会在微信里弹出“已回复”，强制关闭
                 )
             } catch (t: Throwable) {
                 L.e("config parse failed, falling back to default", t)

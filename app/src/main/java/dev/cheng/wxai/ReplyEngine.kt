@@ -499,6 +499,8 @@ object ReplyEngine {
                     val cleanSavedReply = reply.replace("||", " ").replace(Regex(" {2,}"), " ").trim()
                     val turns = SessionManager.appendMessage(ctx, talker, "assistant", cleanSavedReply, System.currentTimeMillis())
 
+                    AiClient.rollSummaryIfNeeded(ctx, cfg, talker, talkerName)
+
                     if (cfg.autoReflectionTurns > 0 && turns >= cfg.autoReflectionTurns) {
                         SessionManager.resetReflectionCounter(ctx, talker)
                         val recentForReflection = SessionManager.getHistory(ctx, talker, maxTurns = 8, expireMinutes = 0)
@@ -723,6 +725,7 @@ object ReplyEngine {
             talker = talker,
             maxTurns = cfg.maxHistoryTurns,
             expireMinutes = cfg.sessionExpireMinutes,
+            useAnchor = true,
         )
 
         if (savedHistory.isNotEmpty()) {
@@ -817,6 +820,10 @@ object ReplyEngine {
         }
 
         if (cfg.enableMemory) {
+            val (convSummary, _) = SessionManager.getSummary(ctx, talker)
+            if (convSummary.isNotBlank()) {
+                append("与该会话更早之前的对话摘要（已滑出上下文窗口，请当作你自己的记忆）：${convSummary}\n")
+            }
             val diaries = SessionManager.getRecentDiaries(ctx, limit = 3)
             if (diaries.isNotEmpty()) {
                 val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.CHINA)

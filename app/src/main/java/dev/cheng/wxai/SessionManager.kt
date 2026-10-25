@@ -22,7 +22,8 @@ import java.util.concurrent.ConcurrentHashMap
 object SessionManager {
 
     private const val DB_NAME = "wxai_memory.db"
-    private const val DB_VERSION = 3
+    private const val DB_VERSION = 4
+    private const val TABLE_SUMMARY = "session_summaries"
 
     private const val TABLE_MESSAGES = "session_messages"
     private const val TABLE_MEMORIES = "long_term_memories"
@@ -319,6 +320,18 @@ object SessionManager {
                     """.trimIndent()
                 )
                 db.execSQL("CREATE INDEX IF NOT EXISTS idx_diary_time ON $TABLE_DIARY(timestamp DESC)")
+
+                // 滚动摘要：滑出上下文窗口的旧对话被压缩为一段摘要，保证记忆可以无限累计而不丢失
+                db.execSQL(
+                    """
+                    CREATE TABLE IF NOT EXISTS $TABLE_SUMMARY (
+                        talker TEXT PRIMARY KEY,
+                        summary TEXT NOT NULL,
+                        upto_id INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                    """.trimIndent()
+                )
             } catch (t: Throwable) {
                 L.e("createAllTables failed", t)
             }
@@ -576,6 +589,7 @@ object SessionManager {
         talker: String,
         maxTurns: Int,
         expireMinutes: Int,
+        useAnchor: Boolean = false,
     ): List<AiClient.ChatMessage> {
         if (maxTurns <= 0) return emptyList()
         val targetCount = (maxTurns * 2).coerceIn(4, 1000)
@@ -629,14 +643,26 @@ object SessionManager {
         if (chronological.isEmpty()) return emptyList()
 
         // 分块锚定逻辑：保证在 [targetCount .. targetCount + stepSize] 区间内，首条消息 ID 恒定不变，实现 100% 追加式前缀缓存命中
+        // 注意：只有主对话上下文（useAnchor=true）才允许读写锚点；反思/指令等小窗口查询绝不能篡改锚点，
+        // 否则会把主上下文错误截断为 8 轮（旧版“上下文只剩十几条、记忆攒不起来”的根因）。
+        if (!useAnchor) {
+            val start = (chronological.size - targetCount).coerceAtLeast(0)
+            var s = start
+            while (s < chronological.size && chronological[s].msg.role != "user") s++
+            return if (s < chronological.size) chronological.subList(s, chronological.size).map { it.msg } else emptyList()
+        }
+
         val currentAnchor = windowAnchorId[talker]
         val anchorIdx = if (currentAnchor != null) {
             chronological.indexOfFirst { it.id >= currentAnchor }
         } else {
             -1
         }
+        // 锚点已滑出查询窗口（窗口首条 id 大于锚点，且查询结果已经达到上限）=> 需要向前推进一个块
+        val anchorOverflow = anchorIdx == 0 && currentAnchor != null &&
+            chronological.first().id > currentAnchor && rowsReversed.size >= queryLimit
 
-        val effectiveStartIdx = if (anchorIdx >= 0 && (chronological.size - anchorIdx) <= queryLimit) {
+        val effectiveStartIdx = if (anchorIdx >= 0 && !anchorOverflow) {
             anchorIdx
         } else {
             // 首次初始化锚点，或当前窗口已超出高水位线 (targetCount + stepSize)：向前裁切一个块并固定新锚点
@@ -655,7 +681,69 @@ object SessionManager {
         } else {
             chronological
         }
+        anchoredSlice.firstOrNull()?.let { contextStartId[talker] = it.id }
         return anchoredSlice.map { it.msg }
+    }
+
+    /** 主上下文窗口当前首条消息 id（早于它的消息已滑出窗口，需要压缩进滚动摘要） */
+    private val contextStartId = ConcurrentHashMap<String, Long>()
+
+    fun getContextStartId(talker: String): Long = contextStartId[talker] ?: 0L
+
+    // ---------------------------------------------------------------- 滚动摘要（长期对话记忆无限累计）
+
+    fun getSummary(ctx: Context, talker: String): Pair<String, Long> {
+        return try {
+            db(ctx).rawQuery(
+                "SELECT summary, upto_id FROM $TABLE_SUMMARY WHERE talker = ? LIMIT 1",
+                arrayOf(talker)
+            ).use { cur ->
+                if (cur.moveToFirst()) cur.getString(0).orEmpty() to cur.getLong(1) else "" to 0L
+            }
+        } catch (t: Throwable) {
+            L.e("getSummary failed", t)
+            "" to 0L
+        }
+    }
+
+    fun saveSummary(ctx: Context, talker: String, summary: String, uptoId: Long) {
+        try {
+            val cv = ContentValues().apply {
+                put("talker", talker)
+                put("summary", summary.trim())
+                put("upto_id", uptoId)
+                put("updated_at", System.currentTimeMillis())
+            }
+            db(ctx).insertWithOnConflict(TABLE_SUMMARY, null, cv, SQLiteDatabase.CONFLICT_REPLACE)
+        } catch (t: Throwable) {
+            L.e("saveSummary failed", t)
+        }
+    }
+
+    /** 读取 (afterId, beforeId) 区间内的消息，用于压缩成摘要 */
+    fun getMessagesBetween(
+        ctx: Context,
+        talker: String,
+        afterId: Long,
+        beforeId: Long,
+        limit: Int = 160,
+    ): List<Pair<Long, AiClient.ChatMessage>> {
+        val list = ArrayList<Pair<Long, AiClient.ChatMessage>>()
+        try {
+            db(ctx).rawQuery(
+                "SELECT id, role, content FROM $TABLE_MESSAGES WHERE talker = ? AND id > ? AND id < ? ORDER BY id ASC LIMIT ?",
+                arrayOf(talker, afterId.toString(), beforeId.toString(), limit.toString())
+            ).use { cur ->
+                while (cur.moveToNext()) {
+                    val role = cur.getString(1) ?: continue
+                    val content = cur.getString(2) ?: continue
+                    list.add(cur.getLong(0) to AiClient.ChatMessage(role = role, content = content))
+                }
+            }
+        } catch (t: Throwable) {
+            L.e("getMessagesBetween failed", t)
+        }
+        return list
     }
 
     fun appendMessage(
@@ -700,7 +788,9 @@ object SessionManager {
     fun clearSession(ctx: Context, talker: String): Int {
         resetReflectionCounter(ctx, talker)
         windowAnchorId.remove(talker)
+        contextStartId.remove(talker)
         return try {
+            runCatching { db(ctx).delete(TABLE_SUMMARY, "talker = ?", arrayOf(talker)) }
             db(ctx).delete(TABLE_MESSAGES, "talker = ?", arrayOf(talker))
         } catch (t: Throwable) {
             L.e("SessionManager.clearSession failed for $talker", t)
