@@ -56,6 +56,58 @@ class LxpEntry : XposedModule() {
                 }
         }
 
+        fun hookMethodBefore(
+            method: Method,
+            before: (thisObj: Any?, args: Array<Any?>) -> Unit,
+        ) {
+            val m = module ?: throw IllegalStateException("LxpEntry.module is null")
+            m.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                .intercept { chain ->
+                    val args = chain.args.toTypedArray()
+                    val thisObj = chain.thisObject
+                    before(thisObj, args)
+                    chain.proceed(args)
+                }
+        }
+
+        fun hookMethodFilter(
+            method: Method,
+            filter: (thisObj: Any?, args: Array<Any?>, result: Any?) -> Any?,
+        ) {
+            val m = module ?: throw IllegalStateException("LxpEntry.module is null")
+            m.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                .intercept { chain ->
+                    val args = chain.args.toTypedArray()
+                    val thisObj = chain.thisObject
+                    val res = chain.proceed(args)
+                    try {
+                        filter(thisObj, args, res)
+                    } catch (t: Throwable) {
+                        L.e("hook filter callback error", t)
+                        res
+                    }
+                }
+        }
+
+        fun hookMethodIntercept(
+            method: Method,
+            interceptor: (chain: XposedInterface.Chain) -> Any?,
+        ) {
+            val m = module ?: throw IllegalStateException("LxpEntry.module is null")
+            m.hook(method)
+                .setExceptionMode(XposedInterface.ExceptionMode.PASSTHROUGH)
+                .intercept { chain ->
+                    try {
+                        interceptor(chain)
+                    } catch (t: Throwable) {
+                        L.e("hook intercept callback error", t)
+                        chain.proceed(chain.args.toTypedArray())
+                    }
+                }
+        }
+
         fun hookMethodReplace(
             method: Method,
             replacement: (thisObj: Any?, args: Array<Any?>) -> Any?,

@@ -237,11 +237,6 @@ object MessageSender {
      * 自动按真人打字速度逐条发送，让聊天极富生命感。
      */
     fun sendHumanLikeText(talker: String, rawReply: String, enableMultiBubble: Boolean, quoteSvrId: Long = 0L): Boolean {
-        val probe = WxAiBrainService.getProbe()
-        if (probe != null) {
-            return probe.sendText(talker, rawReply, enableMultiBubble, quoteSvrId)
-        }
-
         val segments = if (enableMultiBubble) {
             splitIntoBubbles(rawReply)
         } else {
@@ -293,136 +288,100 @@ object MessageSender {
     }
 
     /** 将发送逻辑投递到主线程执行，等待最多 5 秒返回结果。 */
-    fun sendText(talker: String, text: String): Boolean {
-        val probe = WxAiBrainService.getProbe()
-        if (probe != null) {
-            return probe.sendText(talker, text, false, 0L)
-        }
-        return runOnMainBlocking {
-            doSendOnMain(talker, text)
-        }
+    fun sendText(talker: String, text: String): Boolean = runOnMainBlocking {
+        doSendOnMain(talker, text)
     }
 
     /** 拍一拍某人（在群聊 talker 中拍 patTargetWxId，或在私聊中拍对方） */
-    fun sendPat(talker: String, patTargetWxId: String): Boolean {
-        val probe = WxAiBrainService.getProbe()
-        if (probe != null) {
-            return probe.sendPat(talker, patTargetWxId)
+    fun sendPat(talker: String, patTargetWxId: String): Boolean = runOnMainBlocking {
+        ensureResolved()
+        val m = weMessageApiSendPat
+        val inst = weMessageApiInstance
+        if (m == null || inst == null) {
+            L.w("sendPat unavailable: WeKit WeMessageApi not bound")
+            return@runOnMainBlocking false
         }
-        return runOnMainBlocking {
-            ensureResolved()
-            val m = weMessageApiSendPat
-            val inst = weMessageApiInstance
-            if (m == null || inst == null) {
-                L.w("sendPat unavailable: WeKit WeMessageApi not bound")
-                return@runOnMainBlocking false
-            }
-            try {
-                val ok = m.invoke(inst, talker, patTargetWxId) as? Boolean ?: false
-                L.i("sendPat($talker, $patTargetWxId) -> $ok")
-                ok
-            } catch (t: Throwable) {
-                L.e("sendPat failed", t)
-                false
-            }
+        try {
+            val ok = m.invoke(inst, talker, patTargetWxId) as? Boolean ?: false
+            L.i("sendPat($talker, $patTargetWxId) -> $ok")
+            ok
+        } catch (t: Throwable) {
+            L.e("sendPat failed", t)
+            false
         }
     }
 
     /** 引用指定消息（msgSvrId）进行回复 */
-    fun sendQuoteText(talker: String, quotedMsgSvrId: Long, content: String): Boolean {
-        val probe = WxAiBrainService.getProbe()
-        if (probe != null) {
-            return probe.sendText(talker, content, false, quotedMsgSvrId)
+    fun sendQuoteText(talker: String, quotedMsgSvrId: Long, content: String): Boolean = runOnMainBlocking {
+        ensureResolved()
+        val m = weMessageApiSendQuoteSvrId
+        val inst = weMessageApiInstance
+        if (m == null || inst == null || quotedMsgSvrId <= 0L) {
+            return@runOnMainBlocking doSendOnMain(talker, content)
         }
-        return runOnMainBlocking {
-            ensureResolved()
-            val m = weMessageApiSendQuoteSvrId
-            val inst = weMessageApiInstance
-            if (m == null || inst == null || quotedMsgSvrId <= 0L) {
-                return@runOnMainBlocking doSendOnMain(talker, content)
-            }
-            try {
-                ReplyEngine.markAiOutbound(talker, content)
-                val ok = m.invoke(inst, talker, quotedMsgSvrId, content) as? Boolean ?: false
-                if (ok) {
-                    L.i("sendQuoteText($talker, svrId=$quotedMsgSvrId) -> true")
-                    true
-                } else {
-                    doSendOnMain(talker, content)
-                }
-            } catch (t: Throwable) {
-                L.e("sendQuoteText failed, falling back to sendText", t)
+        try {
+            ReplyEngine.markAiOutbound(talker, content)
+            val ok = m.invoke(inst, talker, quotedMsgSvrId, content) as? Boolean ?: false
+            if (ok) {
+                L.i("sendQuoteText($talker, svrId=$quotedMsgSvrId) -> true")
+                true
+            } else {
                 doSendOnMain(talker, content)
             }
+        } catch (t: Throwable) {
+            L.e("sendQuoteText failed, falling back to sendText", t)
+            doSendOnMain(talker, content)
         }
     }
 
     /** 撤回本机发送的消息（通过本地 msgId） */
-    fun revokeMessage(msgId: Long): Boolean {
-        val probe = WxAiBrainService.getProbe()
-        if (probe != null) {
-            return probe.revokeMsg(msgId)
-        }
-        return runOnMainBlocking {
-            ensureResolved()
-            val m = weMessageApiRevokeMsgId
-            val inst = weMessageApiInstance
-            if (m == null || inst == null || msgId <= 0L) return@runOnMainBlocking false
-            try {
-                val ok = m.invoke(inst, msgId) as? Boolean ?: false
-                L.i("revokeMessage(msgId=$msgId) -> $ok")
-                ok
-            } catch (t: Throwable) {
-                L.e("revokeMessage failed", t)
-                false
-            }
+    fun revokeMessage(msgId: Long): Boolean = runOnMainBlocking {
+        ensureResolved()
+        val m = weMessageApiRevokeMsgId
+        val inst = weMessageApiInstance
+        if (m == null || inst == null || msgId <= 0L) return@runOnMainBlocking false
+        try {
+            val ok = m.invoke(inst, msgId) as? Boolean ?: false
+            L.i("revokeMessage(msgId=$msgId) -> $ok")
+            ok
+        } catch (t: Throwable) {
+            L.e("revokeMessage failed", t)
+            false
         }
     }
 
     /** 向指定会话发送联系人的微信名片 */
-    fun sendShareCard(talker: String, cardWxId: String): Boolean {
-        val probe = WxAiBrainService.getProbe()
-        if (probe != null) {
-            return probe.sendCard(talker, cardWxId)
-        }
-        return runOnMainBlocking {
-            ensureResolved()
-            val m = weMessageApiSendShareCard
-            val inst = weMessageApiInstance
-            if (m == null || inst == null) return@runOnMainBlocking false
-            try {
-                val ok = m.invoke(inst, talker, cardWxId) as? Boolean ?: false
-                L.i("sendShareCard($talker, card=$cardWxId) -> $ok")
-                ok
-            } catch (t: Throwable) {
-                L.e("sendShareCard failed", t)
-                false
-            }
+    fun sendShareCard(talker: String, cardWxId: String): Boolean = runOnMainBlocking {
+        ensureResolved()
+        val m = weMessageApiSendShareCard
+        val inst = weMessageApiInstance
+        if (m == null || inst == null) return@runOnMainBlocking false
+        try {
+            val ok = m.invoke(inst, talker, cardWxId) as? Boolean ?: false
+            L.i("sendShareCard($talker, card=$cardWxId) -> $ok")
+            ok
+        } catch (t: Throwable) {
+            L.e("sendShareCard failed", t)
+            false
         }
     }
 
     /** 发布一条纯文字微信朋友圈 */
-    fun postMomentText(content: String): Boolean {
-        val probe = WxAiBrainService.getProbe()
-        if (probe != null) {
-            return probe.postMoment(content)
+    fun postMomentText(content: String): Boolean = runOnMainBlocking {
+        ensureResolved()
+        val m = weMomentsApiPostText
+        val inst = weMomentsApiInstance
+        if (m == null || inst == null || content.isBlank()) {
+            L.w("postMomentText unavailable")
+            return@runOnMainBlocking false
         }
-        return runOnMainBlocking {
-            ensureResolved()
-            val m = weMomentsApiPostText
-            val inst = weMomentsApiInstance
-            if (m == null || inst == null || content.isBlank()) {
-                L.w("postMomentText unavailable")
-                return@runOnMainBlocking false
-            }
-            try {
-                val ok = m.invoke(inst, content.trim(), null, null) as? Boolean ?: false
-                L.i("postMomentText('${content.take(30)}') -> $ok")
-                ok
-            } catch (t: Throwable) {
-                L.e("postMomentText failed", t)
-                false
-            }
+        try {
+            val ok = m.invoke(inst, content.trim(), null, null) as? Boolean ?: false
+            L.i("postMomentText('${content.take(30)}') -> $ok")
+            ok
+        } catch (t: Throwable) {
+            L.e("postMomentText failed", t)
+            false
         }
     }
 

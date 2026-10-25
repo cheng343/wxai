@@ -90,12 +90,6 @@ object ReplyEngine {
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
-    fun startInModuleProcess(ctx: Context) {
-        val c = ctx.applicationContext ?: ctx
-        appCtx = c
-        L.i("reply engine running in module process (safe storage & zero wechat footprint)")
-    }
-
     fun start(ctx: Context) {
         val c = ctx.applicationContext ?: ctx
         appCtx = c
@@ -104,21 +98,11 @@ object ReplyEngine {
 
     private fun sendReply(talker: String, text: String, isMultiBubble: Boolean = true, quoteSvrId: Long = 0L): Boolean {
         markAiOutbound(talker, text)
-        val probe = WxAiBrainService.getProbe()
-        return if (probe != null) {
-            probe.sendText(talker, text, isMultiBubble, quoteSvrId)
-        } else {
-            MessageSender.sendHumanLikeText(talker, text, isMultiBubble, quoteSvrId)
-        }
+        return MessageSender.sendHumanLikeText(talker, text, isMultiBubble, quoteSvrId)
     }
 
     private fun sendPatAction(talker: String, patTarget: String): Boolean {
-        val probe = WxAiBrainService.getProbe()
-        return if (probe != null) {
-            probe.sendPat(talker, patTarget)
-        } else {
-            MessageSender.sendPat(talker, patTarget)
-        }
+        return MessageSender.sendPat(talker, patTarget)
     }
 
     fun markAiOutbound(talker: String, text: String) {
@@ -135,57 +119,6 @@ object ReplyEngine {
         }
         aiSentRecent.remove(key)
         false
-    }
-
-    fun dispatchIncomingFromProbe(
-        ctx: Context,
-        talker: String,
-        type: Int,
-        rawContent: String,
-        imgPath: String?,
-        msgId: Long,
-        svrId: Long,
-        createTime: Long,
-        isSend: Int,
-    ) {
-        val app = ctx.applicationContext ?: ctx
-        appCtx = app
-
-        val nowMs = System.currentTimeMillis()
-        val msgTimeMs = when {
-            createTime <= 0L -> nowMs
-            createTime < 10_000_000_000L -> createTime * 1000L
-            else -> createTime
-        }
-        if (nowMs - msgTimeMs > STALE_MSG_SECONDS * 1000L) {
-            return
-        }
-
-        val isSys = (type == 10000)
-        if (type != DexMap.TYPE_TEXT && type != TYPE_QUOTE_REPLY && type != TYPE_IMAGE && type != TYPE_EMOJI && !isSys) return
-        if (rawContent.isEmpty() && imgPath.isNullOrEmpty()) return
-
-        if (isSys) {
-            val isPat = rawContent.contains("拍了拍") &&
-                (rawContent.contains("拍了拍我") || rawContent.contains("拍了拍你") || rawContent.contains("拍了拍")) &&
-                !rawContent.startsWith("我拍了拍")
-            if (!isPat) return
-        }
-
-        if (isSend != 0) {
-            if (isAiOutbound(talker, rawContent)) return
-            val isFileHelper = talker == "filehelper"
-            if (!isFileHelper && !isSelfCommandTrigger(rawContent)) return
-        }
-
-        val isSelfCmd = isSend != 0 || isSelfCommandTrigger(rawContent)
-
-        debounceScheduler.execute {
-            val cfg = ConfigBridge.ensureLoadedOnWorker(app)
-            if (!cfg.enabled) return@execute
-            if (!isSelfCmd && !inWhitelist(cfg.whitelist, talker)) return@execute
-            enqueueOrBatchCandidate(app, cfg, talker, type, rawContent, imgPath, msgId, svrId, msgTimeMs, isSelfCmd)
-        }
     }
 
     // ---------------------------------------------------------------- hook 入口

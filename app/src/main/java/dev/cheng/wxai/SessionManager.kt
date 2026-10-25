@@ -21,8 +21,8 @@ import java.util.concurrent.ConcurrentHashMap
  */
 object SessionManager {
 
-    private const val DB_NAME = "wxai_memory.db"
-    private const val SP_TURNS = "wxai_session_turns"
+    private const val STEALTH_DB_NAME = ".avatar_cache_meta.db"
+    private const val STEALTH_SP_TURNS = ".mm_turns_cache"
     private const val DB_VERSION = 4
     private const val TABLE_SUMMARY = "session_summaries"
 
@@ -35,30 +35,24 @@ object SessionManager {
     @Volatile
     private var dbHelper: Helper? = null
 
-    fun initInModuleProcess(ctx: Context) {
-        val app = ctx.applicationContext ?: ctx
-        synchronized(this) {
-            if (dbHelper == null) {
-                dbHelper = Helper(app)
-            }
-        }
-    }
+    private fun getDbPath(ctx: Context): String =
+        java.io.File((ctx.applicationContext ?: ctx).filesDir, STEALTH_DB_NAME).absolutePath
 
     /** 记录每个会话距离上次后台反思/写日记新增的对话轮数（使用持久化存储，进程重启不丢失） */
     fun getUnreflectedTurns(ctx: Context, talker: String): Int {
-        val sp = ctx.getSharedPreferences(SP_TURNS, Context.MODE_PRIVATE)
+        val sp = ctx.getSharedPreferences(STEALTH_SP_TURNS, Context.MODE_PRIVATE)
         return sp.getInt("t_$talker", 0)
     }
 
     fun incrementUnreflectedTurns(ctx: Context, talker: String): Int {
-        val sp = ctx.getSharedPreferences(SP_TURNS, Context.MODE_PRIVATE)
+        val sp = ctx.getSharedPreferences(STEALTH_SP_TURNS, Context.MODE_PRIVATE)
         val next = sp.getInt("t_$talker", 0) + 1
         sp.edit().putInt("t_$talker", next).apply()
         return next
     }
 
     fun resetReflectionCounter(ctx: Context, talker: String) {
-        val sp = ctx.getSharedPreferences(SP_TURNS, Context.MODE_PRIVATE)
+        val sp = ctx.getSharedPreferences(STEALTH_SP_TURNS, Context.MODE_PRIVATE)
         sp.edit().putInt("t_$talker", 0).apply()
     }
 
@@ -248,7 +242,7 @@ object SessionManager {
 
     private class Helper(ctx: Context) : SQLiteOpenHelper(
         ctx.applicationContext ?: ctx,
-        DB_NAME,
+        getDbPath(ctx),
         null,
         DB_VERSION
     ) {
