@@ -89,4 +89,16 @@ object DexMap {
 
     /** 文本消息类型码 */
     const val TYPE_TEXT = 1
+
+    // ---- 系统与隐私反检测（与 WeKit 8.0.76 混淆名完全一致）----
+    /** com.tencent.mm.app.h3.a([Ljava/lang/StackTraceElement;)Z —— WeChat 堆栈检测 Xposed */
+    const val XPOSED_DETECT_CLASS = "com.tencent.mm.app.h3"
+    const val XPOSED_DETECT_METHOD = "a"
+
+    /** pg0.n3.kj(): boolean —— WeChat 钱包安全/VPN 检测 */
+    const val VPN_DETECT_CLASS = "pg0.n3"
+    const val VPN_DETECT_METHOD = "kj"
+
+    /** zq3.b.run(): void —— WeChat 后台进程状态异常退出检测器 */
+    const val BG_PROCESS_CHECKER_CLASS = "zq3.b"
 }
