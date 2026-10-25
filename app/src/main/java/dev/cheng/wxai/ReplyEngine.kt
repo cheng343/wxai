@@ -184,6 +184,14 @@ object ReplyEngine {
         }
     }
 
+    private fun isMasterBindCommand(raw: String): Boolean {
+        val c = raw.trim().removePrefix("#").removePrefix("/").removePrefix("@").trim()
+        return c in setOf(
+            "认主", "我是主人", "我是你主人", "我就是你主人", "我是你的主人",
+            "认我为主", "绑定主人", "绑定为主人", "你是我的", "做我仆人", "做我的仆人"
+        ) || c == "认主" || c.startsWith("认主") || (c.contains("我是") && c.contains("主人"))
+    }
+
     private fun isSelfCommandTrigger(raw: String): Boolean {
         val t = raw.trim()
         return t.startsWith("/ai ", ignoreCase = true) ||
@@ -191,8 +199,8 @@ object ReplyEngine {
             t.startsWith("#ai ", ignoreCase = true) ||
             t.startsWith("#人设") ||
             t.startsWith("#风格") ||
+            isMasterBindCommand(t) ||
             t in setOf(
-                "#认主", "认主", "#我是主人", "我是主人", "#我是你主人", "我是你主人",
                 "#重置", "#重置会话", "#清除记忆",
                 "#记忆", "#查看记忆",
                 "#状态", "#心境",
@@ -422,14 +430,23 @@ object ReplyEngine {
 
             val isGroup = talker.endsWith("@chatroom")
             val talkerName = ConversationBridge.getDisplayName(talker)
-            val isMaster = isSelfCmd || isMasterSpeaker(cfg, talker, talkerName, senderWxid, senderName)
-
-            // 如果当前说话人是主人，自动确保其档案关系为「唯一主人」且好感度满值
             val speakerId = if (isGroup && !senderWxid.isNullOrBlank()) senderWxid else talker
             val speakerDisplayName = if (isGroup && !senderWxid.isNullOrBlank()) senderName else talkerName
+            val existingDossier = SessionManager.getDossier(ctx, speakerId, speakerDisplayName)
+
+            // 智能判定主人身份：
+            // 1) 显式自指令 / 文件传输助手；
+            // 2) 匹配配置中设置的 masterTalkers；
+            // 3) 本地记忆数据库中已标记为「唯一主人」；
+            // 4) 若用户未设置 masterTalkers，但在 1对1 私聊白名单中，默认直接视当前私聊对话者为唯一主人！
+            val isMaster = isSelfCmd ||
+                isMasterSpeaker(cfg, talker, talkerName, senderWxid, senderName) ||
+                existingDossier.relationship == "唯一主人" ||
+                (cfg.masterTalkers.isBlank() && !isGroup)
+
+            // 如果当前说话人是主人，自动确保其档案关系为「唯一主人」且好感度满值
             if (isMaster && speakerId != "filehelper") {
-                val existing = SessionManager.getDossier(ctx, speakerId, speakerDisplayName)
-                if (existing.relationship != "唯一主人" || existing.affection < 100) {
+                if (existingDossier.relationship != "唯一主人" || existingDossier.affection < 100) {
                     SessionManager.updateDossier(
                         ctx = ctx,
                         talker = speakerId,
@@ -528,15 +545,15 @@ object ReplyEngine {
 
     private fun isBuiltinCommand(cmd: String): Boolean {
         val c = cmd.trim()
-        return c in setOf(
-            "#认主", "认主", "#我是主人", "我是主人", "#我是你主人", "我是你主人",
-            "#重置", "#重置会话", "#清除记忆", "#reset", "#RESET",
-            "#状态", "#心境",
-            "#好感度", "#档案",
-            "#日记", "#看日记",
-            "#记忆", "#查看记忆",
-            "#人设", "#风格",
-        ) || c.startsWith("#人设") || c.startsWith("#风格")
+        return isMasterBindCommand(c) ||
+            c in setOf(
+                "#重置", "#重置会话", "#清除记忆", "#reset", "#RESET",
+                "#状态", "#心境",
+                "#好感度", "#档案",
+                "#日记", "#看日记",
+                "#记忆", "#查看记忆",
+                "#人设", "#风格",
+            ) || c.startsWith("#人设") || c.startsWith("#风格")
     }
 
     private fun handleBuiltinCommand(
@@ -548,10 +565,10 @@ object ReplyEngine {
     ): Boolean {
         val c = cmd.trim()
         when {
-            c in setOf("#认主", "认主", "#我是主人", "我是主人", "#我是你主人", "我是你主人") -> {
+            isMasterBindCommand(c) -> {
                 val masterWxid = senderWxid?.takeIf { it.isNotBlank() }
                     ?: if (talker == "filehelper") ConversationBridge.getSelfWxid().ifEmpty { "filehelper" } else talker
-                val masterName = ConversationBridge.getDisplayName(masterWxid)
+                val masterName = ConversationBridge.getDisplayName(masterWxid).ifBlank { "主人" }
 
                 val updatedCfg = ConfigBridge.updateFromWechat(ctx) { old ->
                     val existingMasters = old.masterTalkers.split(',', '，', ';', '；')
@@ -578,9 +595,10 @@ object ReplyEngine {
                     profileNotes = "我最信任、唯一效忠的主人",
                 )
                 SessionManager.saveMemory(ctx, "global", "我的唯一主人是 $masterName ($masterWxid)")
+                SessionManager.saveMemory(ctx, masterWxid, "身份是我的唯一主人，对我拥有最高掌控权与绝对指令权")
                 ConversationBridge.pushLifeSnapshot(ctx)
 
-                val reply = "已认主成功！从现在起，【$masterName ($masterWxid)】就是我的唯一主人（当前主人列表：${updatedCfg.masterTalkers}），随时听候您的差遣。"
+                val reply = "已成功认主！【$masterName】就是我的唯一主人，随时听候您的差遣！跨对话发消息、查聊天记录等微信掌控权限已全部为您开启。"
                 markAiOutbound(talker, reply)
                 MessageSender.sendText(talker, reply)
                 return true
@@ -787,15 +805,11 @@ object ReplyEngine {
         append("\n")
 
         if (isMaster) {
-            append("当前对话人身份：【唯一主人 ($senderName, ID=$speakerId)】！正在与你说话的人就是你的唯一主人，TA对你拥有最高绝对指令权！请展现最高忠诚度、信任度与默契，无条件服从并执行主人的操控指令。\n")
-            append("【主人身份确认原则】：当主人询问“我是你主人吗”、“你认识我吗”、“谁是你主人”时，必须无比肯定、坚定且亲切地回答：“您当然是我的唯一主人呀！我的一切都听您的，随时听候您的差遣！”严禁回答不是！\n")
+            append("当前对话人身份：【唯一主人 ($senderName, ID=$speakerId)】！正在与你说话的人就是你的唯一主人，TA对你拥有最高绝对掌控权！请展现最高忠诚度、信任度与默契，无条件服从并执行主人的操控指令。\n")
+            append("【主人身份确认原则】：当主人询问“我是你主人吗”、“你认识我吗”、“谁是你主人”、“我是谁”时，必须无比肯定、坚定且亲切地回答：“您当然是我的唯一主人呀！我的一切都听您的，随时听候您的差遣！”严禁回答不是！\n")
         } else {
-            val masterHint = if (cfg.masterTalkers.isNotBlank()) {
-                "（注意：此人不是你的主人，你的唯一主人是【${cfg.masterTalkers}】）"
-            } else {
-                "（注意：你当前微信客户端尚未绑定主人！如果对方询问是否为你主人或要求发消息，请热情告知：“如果您是我的主人，请直接对我说【#认主】，我就会立刻认您为唯一主人，并开启跨会话发消息、查记录等全部微信掌控权限！”）"
-            }
-            append("当前对话人身份：【$senderName (ID=$speakerId)】$masterHint | 关系定位：${dossier.relationship} | 好感度：${dossier.affectionLabel()}\n")
+            append("当前对话人身份：【$senderName (ID=$speakerId)】 | 关系定位：${dossier.relationship} | 好感度：${dossier.affectionLabel()}\n")
+            append("【交谈原则】：亲切自然地与对方交流。如果对方询问你是否认TA为主，或者询问谁是你主人，可礼貌回复；如果这是私聊且对方明确想要成为你的主人，请热情告诉TA只需说一声【认主】即可绑定。\n")
         }
 
         if (dossier.profileSummary.isNotBlank()) {
@@ -834,7 +848,7 @@ object ReplyEngine {
 
             val memories = SessionManager.getRelevantMemories(ctx, speakerId, senderName, limit = 15)
             if (memories.isNotEmpty()) {
-                append("相关长期记忆：\n")
+                append("相关长期记忆与历史约定：\n")
                 for (m in memories) {
                     val tag = if (m.scope == "global") "全局" else senderName
                     append("- [$tag] ${m.fact}\n")
@@ -866,7 +880,9 @@ object ReplyEngine {
             m.equals(talker, ignoreCase = true) ||
                 m.equals(talkerName, ignoreCase = true) ||
                 (!senderWxid.isNullOrBlank() && m.equals(senderWxid, ignoreCase = true)) ||
-                m.equals(senderName, ignoreCase = true)
+                m.equals(senderName, ignoreCase = true) ||
+                (talkerName.isNotBlank() && (talkerName.contains(m, ignoreCase = true) || m.contains(talkerName, ignoreCase = true))) ||
+                (senderName.isNotBlank() && (senderName.contains(m, ignoreCase = true) || m.contains(senderName, ignoreCase = true)))
         }
     }
 

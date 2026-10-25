@@ -48,10 +48,6 @@ object MainHook {
                     ?: application.classLoader
                     ?: initialCl
 
-                runCatching {
-                    File(application.dataDir, "app_qqprotect").deleteRecursively()
-                }
-
                 boot(application, realCl)
             } catch (t: Throwable) {
                 L.e("wxai-boot failed", t)

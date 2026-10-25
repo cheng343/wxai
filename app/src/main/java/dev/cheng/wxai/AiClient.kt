@@ -88,6 +88,7 @@ object AiClient {
             messages = history,
             allowTools = false,
             toolExecutor = null,
+            maxTokens = 200,
         )
     }
 
@@ -135,6 +136,7 @@ object AiClient {
             messages = effectiveMessages,
             allowTools = allowAgentTools,
             toolExecutor = executor,
+            maxTokens = 180,
         )
     }
 
@@ -177,7 +179,7 @@ object AiClient {
                   "relationship": "与对方的关系定位（如：最信任的主人、聊得来的死党、热闹的群聊、普通朋友）",
                   "affection_delta": 2,
                   "profile_notes": "新发现的关于对方性格、喜好、身份或说话特点的简短画像补充（无新发现则留空字符串）",
-                  "facts": ["值得永久记住的具体客观事实或约定（无则空数组）"],
+                  "facts": ["值得永久记住的具体客观事实、历史约定、对方承诺、个人特征（重要！如对方提到的名字、生日、喜好、双方约定好的事项等，请提炼成明确的事实陈述句；无则空数组）"],
                   "diary": "如果这段对话有趣或重要，写一则50字以内的第一人称心情日记（平淡日常无需写日记则留空字符串）"
                 }
             """.trimIndent()
@@ -188,6 +190,7 @@ object AiClient {
                 messages = listOf(ChatMessage(role = "user", content = "对话记录如下：\n$transcript")),
                 allowTools = false,
                 toolExecutor = null,
+                maxTokens = 1200,
             )
 
             val rawText = res.text ?: return
@@ -205,7 +208,8 @@ object AiClient {
             val isMaster = currentDossier.relationship == "唯一主人" ||
                 (cfg.masterTalkers.isNotBlank() && cfg.masterTalkers.split(',', '，', ';', '；')
                     .map { it.trim() }
-                    .any { it.equals(talker, true) || it.equals(talkerName, true) })
+                    .any { it.equals(talker, true) || it.equals(talkerName, true) }) ||
+                (cfg.masterTalkers.isBlank() && !talker.endsWith("@chatroom"))
 
             val finalRel = if (isMaster) "唯一主人" else obj.optString("relationship", "").takeIf { it.isNotBlank() }
             val finalAffectionDelta = if (isMaster) 100 else obj.optInt("affection_delta", 1).coerceIn(-15, 15)
@@ -224,6 +228,9 @@ object AiClient {
                     val f = arr.optString(i, "").trim()
                     if (f.isNotEmpty()) {
                         SessionManager.saveMemory(ctx, talker, f)
+                        if (isMaster) {
+                            SessionManager.saveMemory(ctx, "global", f)
+                        }
                     }
                 }
             }
@@ -267,6 +274,7 @@ object AiClient {
                 messages = listOf(ChatMessage(role = "user", content = user)),
                 allowTools = false,
                 toolExecutor = null,
+                maxTokens = 800,
             )
             val text = res.text?.trim().orEmpty()
             if (text.isNotEmpty()) {
@@ -392,6 +400,7 @@ object AiClient {
         messages: List<ChatMessage>,
         allowTools: Boolean,
         toolExecutor: ((String, JSONObject) -> String)?,
+        maxTokens: Int? = null,
     ): Result {
         if (cfg.apiKey.isBlank()) return Result(null, "apiKey 为空")
         if (cfg.baseUrl.isBlank()) return Result(null, "baseUrl 为空")
@@ -416,7 +425,9 @@ object AiClient {
                 put("model", cfg.model)
                 put("temperature", cfg.temperature)
                 put("stream", false)
-                put("max_tokens", 180)
+                if (maxTokens != null && maxTokens > 0) {
+                    put("max_tokens", maxTokens)
+                }
                 put("messages", reqMessages)
                 if (toolsEnabled && toolsSpec != null) {
                     put("tools", toolsSpec)

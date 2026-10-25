@@ -352,6 +352,7 @@ object SessionManager {
         try {
             val oldDb = app.getDatabasePath("wxai_memory.db")
             val newDb = java.io.File(getDbPath(app))
+            newDb.parentFile?.mkdirs()
             if (oldDb.exists() && !newDb.exists()) {
                 oldDb.copyTo(newDb, overwrite = true)
             }

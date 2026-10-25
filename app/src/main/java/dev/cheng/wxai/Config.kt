@@ -149,7 +149,7 @@ data class Config(
                 val savedTurns = o.optInt("maxHistoryTurns", DEFAULT.maxHistoryTurns)
                 val migratedTurns = if (savedTurns in 1..15) 100 else savedTurns
                 val savedExpire = o.optInt("sessionExpireMinutes", DEFAULT.sessionExpireMinutes)
-                val migratedExpire = if (savedExpire == 360 || savedExpire == 120) 0 else savedExpire
+                val migratedExpire = if (savedExpire in setOf(120, 360, 60, 30, 1440)) 0 else savedExpire
 
                 val rawPrompt = o.str("systemPrompt", DEFAULT_PROMPT)
                 val cleanPrompt = if (rawPrompt.contains("你在微信中与主人及好友自然交流") || !rawPrompt.contains("Few-Shot")) {
