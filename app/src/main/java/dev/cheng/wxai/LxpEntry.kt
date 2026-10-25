@@ -26,6 +26,7 @@ class LxpEntry : XposedModule() {
         if (proc != null && proc != MainHook.TARGET_PACKAGE) return
 
         L.i("LxpEntry onPackageReady in ${proc ?: param.packageName}")
+        StealthManager.install(param.classLoader)
         MainHook.startBootstrap(param.classLoader)
     }
 
