@@ -15,8 +15,7 @@ import java.lang.reflect.Proxy
 object Hooks {
 
     fun install(ctx: Context, cl: ClassLoader) {
-        MessageSender.init(cl)
-        ReplyEngine.start(ctx)
+        WechatProbe.init(ctx, cl)
 
         // 等待最多 3 秒让 WeKit 完成 ActivityProxy 初始化
         var wekitCl: ClassLoader? = null
@@ -31,9 +30,7 @@ object Hooks {
         }
 
         if (wekitCl != null) {
-            MessageSender.setWeKitClassLoader(wekitCl)
-            ConversationBridge.setWeKitClassLoader(wekitCl)
-            ImageBridge.setWeKitClassLoader(wekitCl)
+            WechatProbe.setWeKitClassLoader(wekitCl)
             if (attachToWeKitListener(wekitCl)) {
                 L.i("attached to WeKit WeDatabaseListenerApi (0 Xposed hooks installed)")
                 return
@@ -108,7 +105,7 @@ object Hooks {
                             val values = args.getOrNull(1) as? ContentValues
                             if (values != null) {
                                 try {
-                                    ReplyEngine.onMessageInsertedValues(values)
+                                    WechatProbe.onMessageInsertedValues(values)
                                 } catch (t: Throwable) {
                                     L.e("onMessageInsertedValues (via WeKit) failed", t)
                                 }
@@ -166,7 +163,7 @@ object Hooks {
 
         val values = args.getOrNull(2) as? ContentValues ?: return
         try {
-            ReplyEngine.onMessageInsertedValues(values)
+            WechatProbe.onMessageInsertedValues(values)
         } catch (t: Throwable) {
             L.e("onMessageInsertedValues failed", t)
         }

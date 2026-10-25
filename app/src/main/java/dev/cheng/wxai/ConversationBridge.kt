@@ -8,6 +8,8 @@ import android.content.IntentFilter
 import android.database.Cursor
 import android.net.Uri
 import android.os.Build
+import org.json.JSONArray
+import org.json.JSONObject
 import java.lang.reflect.Modifier
 import kotlin.concurrent.thread
 
@@ -46,6 +48,18 @@ object ConversationBridge {
 
     fun getSelfWxid(): String {
         cachedSelfWxid?.let { if (it.isNotEmpty()) return it }
+        val probe = WxAiBrainService.getProbe()
+        if (probe != null) {
+            try {
+                val selfObj = JSONObject(probe.getSelfInfo())
+                val w = selfObj.optString("selfWxid", "")
+                if (w.isNotEmpty()) {
+                    cachedSelfWxid = w
+                    return w
+                }
+            } catch (_: Throwable) {
+            }
+        }
         val db = ensureDb() ?: return ""
         try {
             rawQuery(db, "SELECT value FROM userinfo WHERE id = 2 LIMIT 1")?.use { cur ->
@@ -64,6 +78,18 @@ object ConversationBridge {
 
     fun getSelfNickname(): String {
         cachedSelfNickname?.let { if (it.isNotEmpty()) return it }
+        val probe = WxAiBrainService.getProbe()
+        if (probe != null) {
+            try {
+                val selfObj = JSONObject(probe.getSelfInfo())
+                val n = selfObj.optString("selfNickname", "")
+                if (n.isNotEmpty()) {
+                    cachedSelfNickname = n
+                    return n
+                }
+            } catch (_: Throwable) {
+            }
+        }
         val db = ensureDb() ?: return ""
         try {
             rawQuery(db, "SELECT value FROM userinfo WHERE id = 4 LIMIT 1")?.use { cur ->
@@ -347,7 +373,29 @@ object ConversationBridge {
         if (clean.isEmpty()) return ""
         displayNameCache[clean]?.let { return it }
 
-        val db = ensureDb() ?: return clean
+        val db = ensureDb()
+        if (db == null) {
+            val probe = WxAiBrainService.getProbe()
+            if (probe != null) {
+                try {
+                    val json = probe.queryContacts(clean)
+                    if (json.isNotBlank() && json != "[]") {
+                        val arr = JSONArray(json)
+                        for (i in 0 until arr.length()) {
+                            val obj = arr.optJSONObject(i) ?: continue
+                            val u = obj.optString("username", "")
+                            val n = obj.optString("name", "")
+                            if (u.isNotEmpty() && n.isNotEmpty()) {
+                                displayNameCache[u] = n
+                            }
+                        }
+                        displayNameCache[clean]?.let { return it }
+                    }
+                } catch (_: Throwable) {
+                }
+            }
+            return clean
+        }
         val esc = sqlEscape(clean)
         val sql = "SELECT conRemark, nickname FROM rcontact WHERE username = '$esc' LIMIT 1"
         try {
@@ -371,9 +419,42 @@ object ConversationBridge {
      * 按关键词（备注名、昵称、微信号 alias 或 username）搜索联系人或群聊。
      */
     fun findContacts(query: String, limit: Int = 15): List<ConvEntry> {
-        val db = ensureDb() ?: return emptyList()
         val q = query.trim()
         val safeLimit = limit.coerceIn(1, 50)
+        val db = ensureDb()
+        if (db == null) {
+            val probe = WxAiBrainService.getProbe()
+            if (probe != null) {
+                return try {
+                    val jsonStr = probe.queryContacts(q)
+                    if (jsonStr.isBlank() || jsonStr == "[]") return emptyList()
+                    val arr = JSONArray(jsonStr)
+                    val list = ArrayList<ConvEntry>(arr.length())
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val u = obj.optString("username", "")
+                        val n = obj.optString("name", "")
+                        if (u.isNotEmpty() && n.isNotEmpty()) {
+                            displayNameCache[u] = n
+                        }
+                        list.add(
+                            ConvEntry(
+                                username = u,
+                                name = n,
+                                isGroup = obj.optBoolean("isGroup", false),
+                                unread = obj.optInt("unread", 0),
+                                lastTime = obj.optLong("lastTime", 0L),
+                            )
+                        )
+                    }
+                    list
+                } catch (t: Throwable) {
+                    L.e("$TAG findContacts(probe) failed", t)
+                    emptyList()
+                }
+            }
+            return emptyList()
+        }
         val sql = if (q.isEmpty()) {
             """
             SELECT c.username, c.unReadCount, r.nickname, r.conRemark
@@ -456,11 +537,42 @@ object ConversationBridge {
      * 从微信底层 message 表读取指定会话（talker）最近的聊天记录（按时间正序返回）。
      */
     fun queryWechatMessages(talker: String, limit: Int = 20): List<WechatMessageRecord> {
-        val db = ensureDb() ?: return emptyList()
         val cleanTalker = talker.trim()
         if (cleanTalker.isEmpty()) return emptyList()
 
         val safeLimit = limit.coerceIn(1, 50)
+        val db = ensureDb()
+        if (db == null) {
+            val probe = WxAiBrainService.getProbe()
+            if (probe != null) {
+                return try {
+                    val jsonStr = probe.queryMessages(cleanTalker, safeLimit)
+                    if (jsonStr.isBlank() || jsonStr == "[]") return emptyList()
+                    val arr = JSONArray(jsonStr)
+                    val list = ArrayList<WechatMessageRecord>(arr.length())
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        list.add(
+                            WechatMessageRecord(
+                                msgId = obj.optLong("msgId", 0L),
+                                msgSvrId = obj.optLong("svrId", 0L),
+                                senderWxid = obj.optString("senderWxid", ""),
+                                senderName = obj.optString("senderName", ""),
+                                isSelf = obj.optBoolean("isSelf", false),
+                                content = obj.optString("content", ""),
+                                type = obj.optInt("type", 1),
+                                createTimeMs = obj.optLong("createTimeMs", 0L),
+                            )
+                        )
+                    }
+                    list
+                } catch (t: Throwable) {
+                    L.e("$TAG queryWechatMessages(probe) failed", t)
+                    emptyList()
+                }
+            }
+            return emptyList()
+        }
         val esc = sqlEscape(cleanTalker)
         val isGroup = cleanTalker.endsWith("@chatroom")
         val sql = """
@@ -566,9 +678,44 @@ object ConversationBridge {
      * 获取指定群聊（@chatroom）的所有成员列表（含 wxid、昵称/备注）。
      */
     fun getGroupMembers(groupTalker: String, limit: Int = 60): List<ConvEntry> {
-        val db = ensureDb() ?: return emptyList()
         val clean = groupTalker.trim()
         if (!clean.endsWith("@chatroom")) return emptyList()
+
+        val safeLimit = limit.coerceIn(1, 150)
+        val db = ensureDb()
+        if (db == null) {
+            val probe = WxAiBrainService.getProbe()
+            if (probe != null) {
+                return try {
+                    val jsonStr = probe.queryGroupMembers(clean)
+                    if (jsonStr.isBlank() || jsonStr == "[]") return emptyList()
+                    val arr = JSONArray(jsonStr)
+                    val list = ArrayList<ConvEntry>(arr.length())
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        val u = obj.optString("username", "")
+                        val n = obj.optString("name", "")
+                        if (u.isNotEmpty() && n.isNotEmpty()) {
+                            displayNameCache[u] = n
+                        }
+                        list.add(
+                            ConvEntry(
+                                username = u,
+                                name = n,
+                                isGroup = false,
+                                unread = 0,
+                                lastTime = 0L,
+                            )
+                        )
+                    }
+                    list.take(safeLimit)
+                } catch (t: Throwable) {
+                    L.w("$TAG getGroupMembers(probe) failed: ${t.message}")
+                    emptyList()
+                }
+            }
+            return emptyList()
+        }
 
         val esc = sqlEscape(clean)
         var memberListStr = ""
@@ -603,11 +750,39 @@ object ConversationBridge {
      * 在微信全量历史消息表 (message) 中按关键词检索消息记录（跨所有私聊与群聊）。
      */
     fun searchGlobalMessages(keyword: String, limit: Int = 20): List<GlobalMessageHit> {
-        val db = ensureDb() ?: return emptyList()
         val q = keyword.trim()
         if (q.isEmpty()) return emptyList()
 
         val safeLimit = limit.coerceIn(1, 40)
+        val db = ensureDb()
+        if (db == null) {
+            val probe = WxAiBrainService.getProbe()
+            if (probe != null) {
+                return try {
+                    val jsonStr = probe.searchGlobalMessages(q, safeLimit)
+                    if (jsonStr.isBlank() || jsonStr == "[]") return emptyList()
+                    val arr = JSONArray(jsonStr)
+                    val list = ArrayList<GlobalMessageHit>(arr.length())
+                    for (i in 0 until arr.length()) {
+                        val obj = arr.optJSONObject(i) ?: continue
+                        list.add(
+                            GlobalMessageHit(
+                                talker = obj.optString("talker", ""),
+                                talkerName = obj.optString("talkerDisplayName", ""),
+                                senderName = obj.optString("senderName", ""),
+                                content = obj.optString("content", ""),
+                                createTimeMs = obj.optLong("createTimeMs", 0L),
+                            )
+                        )
+                    }
+                    list
+                } catch (t: Throwable) {
+                    L.e("$TAG searchGlobalMessages(probe) failed", t)
+                    emptyList()
+                }
+            }
+            return emptyList()
+        }
         val esc = sqlEscape(q)
         val sql = """
             SELECT talker, isSend, content, createTime

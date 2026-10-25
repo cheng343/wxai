@@ -90,15 +90,34 @@ object ReplyEngine {
 
     private val mainHandler by lazy { Handler(Looper.getMainLooper()) }
 
+    fun startInModuleProcess(ctx: Context) {
+        val c = ctx.applicationContext ?: ctx
+        appCtx = c
+        L.i("reply engine running in module process (safe storage & zero wechat footprint)")
+    }
+
     fun start(ctx: Context) {
         val c = ctx.applicationContext ?: ctx
         appCtx = c
-        L.i("reply engine v2.1 started (KV-Cache Optimized + Debounce Batching + Master Binding)")
-        pool.execute {
-            try {
-                ConversationBridge.pushLifeSnapshot(c)
-            } catch (_: Throwable) {
-            }
+        L.i("reply engine started")
+    }
+
+    private fun sendReply(talker: String, text: String, isMultiBubble: Boolean = true, quoteSvrId: Long = 0L): Boolean {
+        markAiOutbound(talker, text)
+        val probe = WxAiBrainService.getProbe()
+        return if (probe != null) {
+            probe.sendText(talker, text, isMultiBubble, quoteSvrId)
+        } else {
+            MessageSender.sendHumanLikeText(talker, text, isMultiBubble, quoteSvrId)
+        }
+    }
+
+    private fun sendPatAction(talker: String, patTarget: String): Boolean {
+        val probe = WxAiBrainService.getProbe()
+        return if (probe != null) {
+            probe.sendPat(talker, patTarget)
+        } else {
+            MessageSender.sendPat(talker, patTarget)
         }
     }
 
@@ -116,6 +135,57 @@ object ReplyEngine {
         }
         aiSentRecent.remove(key)
         false
+    }
+
+    fun dispatchIncomingFromProbe(
+        ctx: Context,
+        talker: String,
+        type: Int,
+        rawContent: String,
+        imgPath: String?,
+        msgId: Long,
+        svrId: Long,
+        createTime: Long,
+        isSend: Int,
+    ) {
+        val app = ctx.applicationContext ?: ctx
+        appCtx = app
+
+        val nowMs = System.currentTimeMillis()
+        val msgTimeMs = when {
+            createTime <= 0L -> nowMs
+            createTime < 10_000_000_000L -> createTime * 1000L
+            else -> createTime
+        }
+        if (nowMs - msgTimeMs > STALE_MSG_SECONDS * 1000L) {
+            return
+        }
+
+        val isSys = (type == 10000)
+        if (type != DexMap.TYPE_TEXT && type != TYPE_QUOTE_REPLY && type != TYPE_IMAGE && type != TYPE_EMOJI && !isSys) return
+        if (rawContent.isEmpty() && imgPath.isNullOrEmpty()) return
+
+        if (isSys) {
+            val isPat = rawContent.contains("拍了拍") &&
+                (rawContent.contains("拍了拍我") || rawContent.contains("拍了拍你") || rawContent.contains("拍了拍")) &&
+                !rawContent.startsWith("我拍了拍")
+            if (!isPat) return
+        }
+
+        if (isSend != 0) {
+            if (isAiOutbound(talker, rawContent)) return
+            val isFileHelper = talker == "filehelper"
+            if (!isFileHelper && !isSelfCommandTrigger(rawContent)) return
+        }
+
+        val isSelfCmd = isSend != 0 || isSelfCommandTrigger(rawContent)
+
+        debounceScheduler.execute {
+            val cfg = ConfigBridge.ensureLoadedOnWorker(app)
+            if (!cfg.enabled) return@execute
+            if (!isSelfCmd && !inWhitelist(cfg.whitelist, talker)) return@execute
+            enqueueOrBatchCandidate(app, cfg, talker, type, rawContent, imgPath, msgId, svrId, msgTimeMs, isSelfCmd)
+        }
     }
 
     // ---------------------------------------------------------------- hook 入口
@@ -285,7 +355,7 @@ object ReplyEngine {
                 pool.execute {
                     try {
                         Thread.sleep(600L)
-                        MessageSender.sendPat(talker, patTarget)
+                        sendPatAction(talker, patTarget)
                     } catch (_: Throwable) {
                     }
                 }
@@ -507,7 +577,7 @@ object ReplyEngine {
             // 4. 拟人多气泡或单气泡发送（群聊且开启引用回复时，首条气泡自动引用原消息）
             markAiOutbound(talker, reply)
             val targetQuote = if (cfg.enableQuoteReply && isGroup && quoteSvrId > 0L) quoteSvrId else 0L
-            val ok = MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble, targetQuote)
+            val ok = sendReply(talker, reply, cfg.enableMultiBubble, targetQuote)
             if (ok) {
                 recordReplyFinished(talker)
                 if (cfg.enableMemory) {
@@ -599,16 +669,14 @@ object ReplyEngine {
                 ConversationBridge.pushLifeSnapshot(ctx)
 
                 val reply = "已成功认主！【$masterName】就是我的唯一主人，随时听候您的差遣！跨对话发消息、查聊天记录等微信掌控权限已全部为您开启。"
-                markAiOutbound(talker, reply)
-                MessageSender.sendText(talker, reply)
+                sendReply(talker, reply, false)
                 return true
             }
 
             c in setOf("#重置", "#重置会话", "#清除记忆") || c.equals("#reset", ignoreCase = true) -> {
                 val count = SessionManager.clearSession(ctx, talker)
                 val reply = "已重置当前会话上下文（清理了 $count 条记录），我们的永久记忆和好感度依然保留。"
-                markAiOutbound(talker, reply)
-                MessageSender.sendText(talker, reply)
+                sendReply(talker, reply, false)
                 return true
             }
 
@@ -623,7 +691,7 @@ object ReplyEngine {
                     "【正在做】${self.activity}||" +
                     "【内心独白】${self.monologue}||" +
                     "【唯一主人】$masterInfo｜【对你的定位】${dossier.relationship} · ${dossier.affectionLabel()}｜【活跃上下文】${history.size} 条"
-                MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
+                sendReply(talker, reply, cfg.enableMultiBubble)
                 return true
             }
 
@@ -633,8 +701,7 @@ object ReplyEngine {
                 val dossier = SessionManager.getDossier(ctx, targetId, targetName)
                 val notes = dossier.profileSummary.ifBlank { "还在慢慢了解中" }
                 val reply = "【${dossier.displayName} 的专属档案】关系：${dossier.relationship}｜好感度：${dossier.affectionLabel()}｜印象：$notes"
-                markAiOutbound(talker, reply)
-                MessageSender.sendText(talker, reply)
+                sendReply(talker, reply, false)
                 return true
             }
 
@@ -655,7 +722,7 @@ object ReplyEngine {
                         "📒 [${fmt.format(Date(d.timestamp))} · 心情:${d.mood}] ${d.entry}"
                     }
                 }
-                MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
+                sendReply(talker, reply, cfg.enableMultiBubble)
                 return true
             }
 
@@ -675,8 +742,7 @@ object ReplyEngine {
                     "活跃上下文 ${history.size} 条；永久记忆 ${memories.size} 条：$summary"
                 }
                 val safeReply = sanitize(reply, cfg.maxReplyChars, false)
-                markAiOutbound(talker, safeReply)
-                MessageSender.sendText(talker, safeReply)
+                sendReply(talker, safeReply, false)
                 return true
             }
 
@@ -693,7 +759,7 @@ object ReplyEngine {
                         "• #人设 毒舌（毒舌腹黑损友，神级吐槽与阴阳）\n" +
                         "• #人设 猫娘（软萌可爱猫娘，句尾带喵超治愈）\n" +
                         "• #人设 管家（全能高智商管家，严谨靠谱执行力）"
-                    MessageSender.sendHumanLikeText(talker, reply, cfg.enableMultiBubble)
+                    sendReply(talker, reply, cfg.enableMultiBubble)
                     return true
                 }
 
@@ -711,8 +777,7 @@ object ReplyEngine {
                 }
 
                 val reply = "已成功切换人设风格为：【${updatedCfg.personaPresetLabel()}】！随时发消息来和我互动吧[旺柴]"
-                markAiOutbound(talker, reply)
-                MessageSender.sendText(talker, reply)
+                sendReply(talker, reply, false)
                 return true
             }
         }
